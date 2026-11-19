@@ -30,12 +30,8 @@ npm-debug.log*
 # Screenshots of workbooks
 screenshots/
 
-# Editor and OS files (shared .vscode config stays tracked)
-.vscode/*
-!.vscode/extensions.json
-!.vscode/launch.json
-!.vscode/settings.json
-!.vscode/tasks.json
+# Editor and OS files
+.vscode/
 .idea/
 Thumbs.db
 Desktop.ini
