@@ -4,9 +4,11 @@
  * Expected header row (column order does not matter, header names are
  * case-insensitive):
  *
- *   Enabled | Worksheet | WatchedCells | FilterColumnIndex | FilterValue | DelayMs | Action
+ *   Enabled | Worksheet | WatchedCells | FilterColumnIndex | FilterValue | DelayMs | Action | Platforms
  *
- * DelayMs and Action are optional; blank cells use the defaults below.
+ * DelayMs, Action and Platforms are optional; blank cells use the defaults below.
+ * Platforms limits a rule to Excel for the web ("web"), desktop Excel ("desktop")
+ * or both ("all", the default), e.g. when desktop already has its own refresh logic.
  */
 
 import { parseAddressList } from "./address";
@@ -17,6 +19,10 @@ export const ACTION_FILTER_VALUE = "filter-value";
 
 const SUPPORTED_ACTIONS = new Set([ACTION_FILTER_VALUE]);
 
+export const PLATFORM_WEB = "web";
+export const PLATFORM_DESKTOP = "desktop";
+const ALL_PLATFORMS = [PLATFORM_WEB, PLATFORM_DESKTOP];
+
 const COLUMNS = {
   enabled: { header: "Enabled", required: true },
   worksheet: { header: "Worksheet", required: true },
@@ -25,6 +31,7 @@ const COLUMNS = {
   filterValue: { header: "FilterValue", required: true },
   delayMs: { header: "DelayMs", required: false },
   action: { header: "Action", required: false },
+  platforms: { header: "Platforms", required: false },
 };
 
 /**
@@ -130,6 +137,8 @@ function buildRule(cell, worksheetsByName) {
     }
   }
 
+  const platforms = isBlank(cell("platforms")) ? ALL_PLATFORMS : parsePlatforms(cell("platforms"));
+
   return {
     enabled: true,
     worksheetId: worksheet.id,
@@ -140,7 +149,27 @@ function buildRule(cell, worksheetsByName) {
     filterValue,
     delayMs,
     action,
+    platforms,
   };
+}
+
+function parsePlatforms(value) {
+  const platforms = new Set();
+
+  for (const name of String(value).toLowerCase().split(/[\s,;]+/)) {
+    if (name === "") {
+      continue;
+    }
+    if (name === "all") {
+      ALL_PLATFORMS.forEach((platform) => platforms.add(platform));
+    } else if (ALL_PLATFORMS.includes(name)) {
+      platforms.add(name);
+    } else {
+      throw new Error(`Platforms "${name}" is not supported. Use web, desktop or all.`);
+    }
+  }
+
+  return platforms.size > 0 ? [...platforms] : ALL_PLATFORMS;
 }
 
 function isBlank(value) {

@@ -9,7 +9,13 @@
 /* global console, document, Excel, Office, performance, window */
 
 import { areasIntersect, parseAddressList } from "./address";
-import { ACTION_FILTER_VALUE, CONFIG_SHEET_NAME, parseConfiguration } from "./config";
+import {
+  ACTION_FILTER_VALUE,
+  CONFIG_SHEET_NAME,
+  PLATFORM_DESKTOP,
+  PLATFORM_WEB,
+  parseConfiguration,
+} from "./config";
 
 // Run pending rules anyway if no calculation event follows a watched change.
 const CALCULATION_FALLBACK_MS = 2000;
@@ -79,11 +85,18 @@ async function loadConfiguration() {
       };
     });
 
+    // The startup setting is stored in the workbook and shared by all platforms,
+    // so it depends only on the configuration sheet, not on the current platform.
     await updateStartupBehavior(result.found);
 
     resetPendingWork();
     configurationFound = result.found;
-    rulesByWorksheetId = groupRulesByWorksheet(result.found ? result.rules : []);
+
+    const platform = getCurrentPlatform();
+    const activeRules = result.found
+      ? result.rules.filter((rule) => rule.platforms.includes(platform))
+      : [];
+    rulesByWorksheetId = groupRulesByWorksheet(activeRules);
 
     if (!result.found) {
       setStatus("No filter refresh configuration was found.");
@@ -95,13 +108,15 @@ async function loadConfiguration() {
 
     await registerEventHandlers([...rulesByWorksheetId.keys()]);
 
-    const ruleCount = result.rules.length;
+    const ruleCount = activeRules.length;
     const invalidText =
       result.errors.length > 0
         ? ` Configuration contains ${pluralize(result.errors.length, "problem")}.`
         : "";
 
-    if (ruleCount === 0) {
+    if (ruleCount === 0 && result.rules.length > 0) {
+      setStatus(`Automatic filter refresh is not enabled for this version of Excel.${invalidText}`);
+    } else if (ruleCount === 0) {
       setStatus(`No active filter refresh rules were found.${invalidText}`);
     } else {
       setStatus(
@@ -132,6 +147,12 @@ async function updateStartupBehavior(configured) {
   } catch (error) {
     console.error("Could not set the add-in startup behavior.", error);
   }
+}
+
+function getCurrentPlatform() {
+  return Office.context.platform === Office.PlatformType.OfficeOnline
+    ? PLATFORM_WEB
+    : PLATFORM_DESKTOP;
 }
 
 function groupRulesByWorksheet(rules) {
