@@ -79,6 +79,8 @@ async function loadConfiguration() {
       };
     });
 
+    await updateStartupBehavior(result.found);
+
     resetPendingWork();
     configurationFound = result.found;
     rulesByWorksheetId = groupRulesByWorksheet(result.found ? result.rules : []);
@@ -110,6 +112,25 @@ async function loadConfiguration() {
   } catch (error) {
     console.error(error);
     setStatus(`Configuration could not be loaded: ${error.message}`);
+  }
+}
+
+/**
+ * With the shared runtime, the add-in keeps running after the task pane is
+ * closed. Loading on document open is a per-document setting, so only enable
+ * it for workbooks that contain a configuration sheet.
+ */
+async function updateStartupBehavior(configured) {
+  if (!Office.addin || !Office.context.requirements.isSetSupported("SharedRuntime", "1.1")) {
+    return;
+  }
+
+  try {
+    await Office.addin.setStartupBehavior(
+      configured ? Office.StartupBehavior.load : Office.StartupBehavior.none
+    );
+  } catch (error) {
+    console.error("Could not set the add-in startup behavior.", error);
   }
 }
 
