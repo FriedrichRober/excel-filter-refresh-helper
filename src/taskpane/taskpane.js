@@ -2,15 +2,23 @@
  * Configurable Excel filter refresh helper.
  *
  * Reads rules from a configuration worksheet. When a watched cell changes, the
- * add-in waits for the worksheet calculation and then re-applies a value filter
- * on one column of the worksheet's AutoFilter, leaving other columns untouched.
+ * add-in runs the rule's action on that worksheet:
+ *
+ *   filter-value  re-applies a value filter on one column of the AutoFilter,
+ *                 leaving other columns untouched (after recalculation)
+ *   sort          sorts the AutoFilter range by one column and keeps all
+ *                 filters (after recalculation)
+ *   show-columns  shows the columns the watched cell's value selects and hides
+ *                 the other columns of the rule (right away)
  */
 
 /* global console, document, Excel, Office, performance, window */
 
-import { areasIntersect, parseAddressList } from "./address";
+import { areasIntersect, columnLetters, parseAddressList } from "./address";
 import {
   ACTION_FILTER_VALUE,
+  ACTION_SHOW_COLUMNS,
+  ACTION_SORT,
   CONFIG_SHEET_NAME,
   PLATFORM_DESKTOP,
   PLATFORM_WEB,
@@ -218,6 +226,11 @@ async function handleWorksheetAdded() {
 // Change and calculation sequence
 // ---------------------------------------------------------------------------
 
+/** Actions that depend on formula results and therefore wait for recalculation. */
+function waitsForCalculation(rule) {
+  return rule.action !== ACTION_SHOW_COLUMNS;
+}
+
 async function handleWorksheetChanged(event) {
   const rules = rulesByWorksheetId.get(event.worksheetId);
 
@@ -240,17 +253,33 @@ async function handleWorksheetChanged(event) {
   }
 
   const state = getWorksheetState(event.worksheetId);
-  matchingRules.forEach((rule) => state.pendingRules.add(rule));
-  state.changedAt = performance.now();
+  const immediateRules = matchingRules.filter((rule) => !waitsForCalculation(rule));
+  const calculatedRules = matchingRules.filter(waitsForCalculation);
 
-  window.clearTimeout(state.debounceTimer);
-  window.clearTimeout(state.fallbackTimer);
-  state.fallbackTimer = window.setTimeout(
-    () => flushPendingRules(event.worksheetId),
-    CALCULATION_FALLBACK_MS
-  );
+  if (immediateRules.length > 0) {
+    immediateRules.forEach((rule) => state.immediateRules.add(rule));
+    state.immediateChangedAt = performance.now();
 
-  setStatus("Change detected. Waiting for calculation.");
+    window.clearTimeout(state.immediateTimer);
+    state.immediateTimer = window.setTimeout(
+      () => flushImmediateRules(event.worksheetId),
+      maxDelay(state.immediateRules)
+    );
+  }
+
+  if (calculatedRules.length > 0) {
+    calculatedRules.forEach((rule) => state.pendingRules.add(rule));
+    state.changedAt = performance.now();
+
+    window.clearTimeout(state.debounceTimer);
+    window.clearTimeout(state.fallbackTimer);
+    state.fallbackTimer = window.setTimeout(
+      () => flushPendingRules(event.worksheetId),
+      CALCULATION_FALLBACK_MS
+    );
+
+    setStatus("Change detected. Waiting for calculation.");
+  }
 }
 
 async function handleWorksheetCalculated(event) {
@@ -260,10 +289,11 @@ async function handleWorksheetCalculated(event) {
     return;
   }
 
-  const delayMs = Math.max(...[...state.pendingRules].map((rule) => rule.delayMs));
-
   window.clearTimeout(state.debounceTimer);
-  state.debounceTimer = window.setTimeout(() => flushPendingRules(event.worksheetId), delayMs);
+  state.debounceTimer = window.setTimeout(
+    () => flushPendingRules(event.worksheetId),
+    maxDelay(state.pendingRules)
+  );
 }
 
 function flushPendingRules(worksheetId) {
@@ -280,6 +310,23 @@ function flushPendingRules(worksheetId) {
   }
 }
 
+function flushImmediateRules(worksheetId) {
+  const state = getWorksheetState(worksheetId);
+
+  window.clearTimeout(state.immediateTimer);
+
+  const rules = [...state.immediateRules];
+  state.immediateRules.clear();
+
+  if (rules.length > 0) {
+    runRefresh(worksheetId, rules, state.immediateChangedAt);
+  }
+}
+
+function maxDelay(rules) {
+  return Math.max(0, ...[...rules].map((rule) => rule.delayMs));
+}
+
 // ---------------------------------------------------------------------------
 // Concurrency
 // ---------------------------------------------------------------------------
@@ -291,6 +338,9 @@ function getWorksheetState(worksheetId) {
       changedAt: 0,
       debounceTimer: null,
       fallbackTimer: null,
+      immediateRules: new Set(),
+      immediateChangedAt: 0,
+      immediateTimer: null,
       running: false,
       queuedRules: new Set(),
       queuedStartedAt: 0,
@@ -300,11 +350,17 @@ function getWorksheetState(worksheetId) {
   return worksheetStates.get(worksheetId);
 }
 
+function clearWaitingWork(state) {
+  window.clearTimeout(state.debounceTimer);
+  window.clearTimeout(state.fallbackTimer);
+  window.clearTimeout(state.immediateTimer);
+  state.pendingRules.clear();
+  state.immediateRules.clear();
+}
+
 function resetPendingWork() {
   for (const state of worksheetStates.values()) {
-    window.clearTimeout(state.debounceTimer);
-    window.clearTimeout(state.fallbackTimer);
-    state.pendingRules.clear();
+    clearWaitingWork(state);
     state.queuedRules.clear();
   }
 }
@@ -339,73 +395,225 @@ async function runRefresh(worksheetId, rules, startedAt) {
 }
 
 // ---------------------------------------------------------------------------
-// Filter action
+// Actions
 // ---------------------------------------------------------------------------
 
 async function applyRules(worksheetId, rules, startedAt) {
-  // Merge rules into one value filter per column so each column is applied once.
+  // Merge rules: one value filter per column, the last sort rule, and every
+  // column rule, so each piece of work is done once.
   const valuesByColumn = new Map();
+  const columnRules = [];
+  let sortRule = null;
 
   for (const rule of rules) {
-    if (rule.action !== ACTION_FILTER_VALUE) {
-      continue;
+    if (rule.action === ACTION_FILTER_VALUE) {
+      if (!valuesByColumn.has(rule.filterColumnIndex)) {
+        valuesByColumn.set(rule.filterColumnIndex, new Set());
+      }
+      valuesByColumn.get(rule.filterColumnIndex).add(rule.filterValue);
+    } else if (rule.action === ACTION_SORT) {
+      sortRule = rule;
+    } else if (rule.action === ACTION_SHOW_COLUMNS) {
+      columnRules.push(rule);
     }
-    if (!valuesByColumn.has(rule.filterColumnIndex)) {
-      valuesByColumn.set(rule.filterColumnIndex, new Set());
-    }
-    valuesByColumn.get(rule.filterColumnIndex).add(rule.filterValue);
   }
 
-  if (valuesByColumn.size === 0) {
+  if (valuesByColumn.size === 0 && !sortRule && columnRules.length === 0) {
     return;
   }
 
-  const filterStartedAt = performance.now();
-  setStatus("Refreshing filter...");
+  const stepStartedAt = performance.now();
+  const doneText = sortRule
+    ? "Sorted"
+    : valuesByColumn.size > 0
+      ? "Filter refreshed"
+      : "Columns updated";
+  setStatus(sortRule ? "Sorting..." : valuesByColumn.size > 0 ? "Refreshing filter..." : "Updating columns...");
 
   try {
     await Excel.run(async (context) => {
-      const autoFilter = context.workbook.worksheets.getItem(worksheetId).autoFilter;
+      const worksheet = context.workbook.worksheets.getItem(worksheetId);
+      const autoFilter = worksheet.autoFilter;
       const filterRange = autoFilter.getRangeOrNullObject();
+      const usesFilter = sortRule !== null || valuesByColumn.size > 0;
+      // Filtering is usually allowed on protected sheets; sorting and hiding
+      // columns need the protection lifted for the change.
+      const needsUnprotect = sortRule !== null || columnRules.length > 0;
 
       filterRange.load("isNullObject,columnCount");
+      if (needsUnprotect) {
+        worksheet.protection.load("protected,options");
+      }
+      if (sortRule) {
+        autoFilter.load("criteria");
+      }
+      const choiceCells = columnRules.map((rule) => {
+        const area = rule.watchedAreas[0];
+        const cell = worksheet.getRange(`${columnLetters(area.left)}${area.top}`);
+        cell.load("values");
+        return cell;
+      });
       await context.sync();
 
-      if (filterRange.isNullObject) {
-        throw new Error("The worksheet has no AutoFilter range.");
+      if (usesFilter) {
+        validateFilterColumns(filterRange, [
+          ...valuesByColumn.keys(),
+          ...(sortRule ? [sortRule.sortColumnIndex] : []),
+        ]);
       }
 
-      for (const columnIndex of valuesByColumn.keys()) {
-        if (columnIndex >= filterRange.columnCount) {
-          throw new Error(
-            `Filter column index ${columnIndex} is outside the AutoFilter range ` +
-              `(${pluralize(filterRange.columnCount, "column")}).`
-          );
+      const protectionOptions =
+        needsUnprotect && worksheet.protection.protected ? worksheet.protection.options : null;
+      if (protectionOptions) {
+        worksheet.protection.unprotect();
+      }
+
+      try {
+        columnRules.forEach((rule, index) => showColumns(worksheet, rule, choiceCells[index].values[0][0]));
+
+        if (sortRule) {
+          await sortKeepingFilters(context, autoFilter, filterRange, sortRule, valuesByColumn);
+        } else {
+          // apply() with a column index only replaces that column's criteria;
+          // it is much faster than autoFilter.reapply().
+          for (const [columnIndex, values] of valuesByColumn) {
+            autoFilter.apply(filterRange, columnIndex, {
+              filterOn: Excel.FilterOn.values,
+              values: [...values],
+            });
+          }
+        }
+
+        await context.sync();
+      } finally {
+        if (protectionOptions) {
+          try {
+            worksheet.protection.protect(protectionOptions);
+            await context.sync();
+          } catch (error) {
+            console.error("Could not protect the worksheet again.", error);
+          }
         }
       }
-
-      // apply() with a column index only replaces that column's criteria;
-      // it is much faster than autoFilter.reapply().
-      for (const [columnIndex, values] of valuesByColumn) {
-        autoFilter.apply(filterRange, columnIndex, {
-          filterOn: Excel.FilterOn.values,
-          values: [...values],
-        });
-      }
-
-      await context.sync();
     });
 
     const finishedAt = performance.now();
-    const totalMs = Math.round(finishedAt - (startedAt || filterStartedAt));
-    const filterMs = Math.round(finishedAt - filterStartedAt);
+    const totalMs = Math.round(finishedAt - (startedAt || stepStartedAt));
+    const stepMs = Math.round(finishedAt - stepStartedAt);
 
-    console.debug(`Filter refresh: total ${totalMs} ms, filter step ${filterMs} ms.`);
-    setStatus(`Filter refreshed in ${totalMs} ms; filter step ${filterMs} ms.`);
+    console.debug(`${doneText}: total ${totalMs} ms, Excel step ${stepMs} ms.`);
+    setStatus(`${doneText} in ${totalMs} ms; Excel step ${stepMs} ms.`);
   } catch (error) {
     console.error(error);
     setStatus(`Refresh failed: ${error.message}`);
   }
+}
+
+function validateFilterColumns(filterRange, columnIndexes) {
+  if (filterRange.isNullObject) {
+    throw new Error("The worksheet has no AutoFilter range.");
+  }
+
+  for (const columnIndex of columnIndexes) {
+    if (columnIndex >= filterRange.columnCount) {
+      throw new Error(
+        `Column index ${columnIndex} is outside the AutoFilter range ` +
+          `(${pluralize(filterRange.columnCount, "column")}).`
+      );
+    }
+  }
+}
+
+/**
+ * Shows the columns of the choice in the watched cell and hides the columns of
+ * the other choices. A value that is not one of the choices shows them all.
+ */
+function showColumns(worksheet, rule, value) {
+  const shown = rule.columnChoices.get(String(value ?? "").trim().toLowerCase());
+  const allColumns = [...new Set([...rule.columnChoices.values()].flat())].sort((a, b) => a - b);
+
+  // Set adjacent columns with the same state in one range.
+  let runStart = null;
+  let runHidden = null;
+  let previous = null;
+
+  const flush = () => {
+    if (runStart !== null) {
+      const address = `${columnLetters(runStart)}:${columnLetters(previous)}`;
+      worksheet.getRange(address).columnHidden = runHidden;
+    }
+  };
+
+  for (const column of allColumns) {
+    const hidden = shown ? !shown.includes(column) : false;
+
+    if (runStart === null || column !== previous + 1 || hidden !== runHidden) {
+      flush();
+      runStart = column;
+      runHidden = hidden;
+    }
+    previous = column;
+  }
+  flush();
+}
+
+/**
+ * Excel sorts only the rows a filter shows, so the criteria are saved, cleared
+ * for the sort and applied again. Columns with a filter-value rule get that
+ * rule's value instead of the saved one. A saved criterion that cannot be
+ * applied again is skipped, so the sheet shows more rows instead of stopping.
+ */
+async function sortKeepingFilters(context, autoFilter, filterRange, sortRule, valuesByColumn) {
+  const criteria = (autoFilter.criteria || []).map(cleanCriteria);
+
+  for (const [columnIndex, values] of valuesByColumn) {
+    criteria[columnIndex] = { filterOn: Excel.FilterOn.values, values: [...values] };
+  }
+
+  autoFilter.clearCriteria();
+  filterRange.sort.apply(
+    [{ key: sortRule.sortColumnIndex, ascending: sortRule.ascending }],
+    false,
+    true
+  );
+  await context.sync();
+
+  const filtered = [];
+  criteria.forEach((criterion, columnIndex) => {
+    if (criterion) {
+      filtered.push([columnIndex, criterion]);
+      autoFilter.apply(filterRange, columnIndex, criterion);
+    }
+  });
+
+  try {
+    await context.sync();
+  } catch (error) {
+    console.error("Re-applying the filters at once failed; applying them one by one.", error);
+
+    for (const [columnIndex, criterion] of filtered) {
+      try {
+        autoFilter.apply(filterRange, columnIndex, criterion);
+        await context.sync();
+      } catch (columnError) {
+        console.error(`Filter on column index ${columnIndex} could not be applied again.`, columnError);
+      }
+    }
+  }
+}
+
+function cleanCriteria(criterion) {
+  if (!criterion || !criterion.filterOn) {
+    return null;
+  }
+
+  const cleaned = {};
+  for (const [key, value] of Object.entries(criterion)) {
+    if (value !== undefined && value !== null && value !== "") {
+      cleaned[key] = value;
+    }
+  }
+  return cleaned;
 }
 
 // ---------------------------------------------------------------------------
@@ -440,11 +648,8 @@ async function refreshActiveWorksheet() {
     return;
   }
 
-  // The manual run covers anything still waiting for calculation.
-  const state = getWorksheetState(worksheetId);
-  window.clearTimeout(state.debounceTimer);
-  window.clearTimeout(state.fallbackTimer);
-  state.pendingRules.clear();
+  // The manual run covers anything still waiting.
+  clearWaitingWork(getWorksheetState(worksheetId));
 
   await runRefresh(worksheetId, rules, performance.now());
 }

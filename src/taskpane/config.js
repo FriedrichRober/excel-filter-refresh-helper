@@ -1,23 +1,39 @@
 /*
- * Reads and validates filter refresh rules from a configuration worksheet.
+ * Reads and validates refresh rules from a configuration worksheet.
  *
- * Expected header row (column order does not matter, header names are
- * case-insensitive):
+ * The first row holds the headers (column order does not matter, header names
+ * are case-insensitive). Enabled, Worksheet and WatchedCells are required; the
+ * other columns are only needed by the actions that use them:
  *
- *   Enabled | Worksheet | WatchedCells | FilterColumnIndex | FilterValue | DelayMs | Action | Platforms
+ *   Enabled          TRUE/1 to use the rule
+ *   Worksheet        worksheet name
+ *   WatchedCells     cells or ranges that trigger the rule, e.g. "B2,B3" or "B2:B4"
+ *   Action           filter-value (default), sort or show-columns
+ *   FilterColumnIndex  filter-value: zero-based column within the AutoFilter range
+ *   FilterValue        filter-value: the value to show in that column
+ *   SortColumnIndex    sort: zero-based column within the AutoFilter range
+ *   SortOrder          sort: ascending (default) or descending
+ *   ColumnChoices      show-columns: "choice=columns;choice=columns", e.g.
+ *                      "Only A=E:E,H:H;Only B=F:F,I:I". When the watched cell holds
+ *                      one of the choices, its columns are shown and the columns of
+ *                      the other choices are hidden; any other value shows them all.
+ *   DelayMs          debounce delay in milliseconds (default 100)
+ *   Platforms        web, desktop or all (default), e.g. when desktop Excel already
+ *                    has its own refresh logic
  *
- * DelayMs, Action and Platforms are optional; blank cells use the defaults below.
- * Platforms limits a rule to Excel for the web ("web"), desktop Excel ("desktop")
- * or both ("all", the default), e.g. when desktop already has its own refresh logic.
+ * filter-value and sort run after the worksheet has recalculated; sort keeps
+ * all filters of the AutoFilter range. show-columns runs right after the change.
  */
 
 import { parseAddressList } from "./address";
 
 export const CONFIG_SHEET_NAME = "_FilterRefreshConfig";
 export const DEFAULT_DELAY_MS = 100;
-export const ACTION_FILTER_VALUE = "filter-value";
 
-const SUPPORTED_ACTIONS = new Set([ACTION_FILTER_VALUE]);
+export const ACTION_FILTER_VALUE = "filter-value";
+export const ACTION_SORT = "sort";
+export const ACTION_SHOW_COLUMNS = "show-columns";
+const SUPPORTED_ACTIONS = [ACTION_FILTER_VALUE, ACTION_SORT, ACTION_SHOW_COLUMNS];
 
 export const PLATFORM_WEB = "web";
 export const PLATFORM_DESKTOP = "desktop";
@@ -27,11 +43,14 @@ const COLUMNS = {
   enabled: { header: "Enabled", required: true },
   worksheet: { header: "Worksheet", required: true },
   watchedCells: { header: "WatchedCells", required: true },
-  filterColumnIndex: { header: "FilterColumnIndex", required: true },
-  filterValue: { header: "FilterValue", required: true },
-  delayMs: { header: "DelayMs", required: false },
-  action: { header: "Action", required: false },
-  platforms: { header: "Platforms", required: false },
+  action: { header: "Action" },
+  filterColumnIndex: { header: "FilterColumnIndex" },
+  filterValue: { header: "FilterValue" },
+  sortColumnIndex: { header: "SortColumnIndex" },
+  sortOrder: { header: "SortOrder" },
+  columnChoices: { header: "ColumnChoices" },
+  delayMs: { header: "DelayMs" },
+  platforms: { header: "Platforms" },
 };
 
 /**
@@ -111,14 +130,12 @@ function buildRule(cell, worksheetsByName) {
   }
   const watchedAreas = parseAddressList(watchedCells);
 
-  const filterColumnIndex = toNumber(cell("filterColumnIndex"));
-  if (!Number.isInteger(filterColumnIndex) || filterColumnIndex < 0) {
-    throw new Error("FilterColumnIndex must be a non-negative whole number.");
-  }
-
-  const filterValue = String(cell("filterValue") ?? "");
-  if (filterValue.trim() === "") {
-    throw new Error("FilterValue is empty.");
+  let action = ACTION_FILTER_VALUE;
+  if (!isBlank(cell("action"))) {
+    action = String(cell("action")).trim().toLowerCase();
+    if (!SUPPORTED_ACTIONS.includes(action)) {
+      throw new Error(`Action "${action}" is not supported. Use ${SUPPORTED_ACTIONS.join(", ")}.`);
+    }
   }
 
   let delayMs = DEFAULT_DELAY_MS;
@@ -129,28 +146,73 @@ function buildRule(cell, worksheetsByName) {
     }
   }
 
-  let action = ACTION_FILTER_VALUE;
-  if (!isBlank(cell("action"))) {
-    action = String(cell("action")).trim().toLowerCase();
-    if (!SUPPORTED_ACTIONS.has(action)) {
-      throw new Error(`Action "${action}" is not supported.`);
-    }
-  }
-
   const platforms = isBlank(cell("platforms")) ? ALL_PLATFORMS : parsePlatforms(cell("platforms"));
 
-  return {
+  const rule = {
     enabled: true,
     worksheetId: worksheet.id,
     worksheetName: worksheet.name,
     watchedAddresses: watchedCells,
     watchedAreas,
-    filterColumnIndex,
-    filterValue,
-    delayMs,
     action,
+    delayMs,
     platforms,
   };
+
+  if (action === ACTION_FILTER_VALUE) {
+    rule.filterColumnIndex = toColumnIndex(cell("filterColumnIndex"), "FilterColumnIndex");
+
+    rule.filterValue = String(cell("filterValue") ?? "");
+    if (rule.filterValue.trim() === "") {
+      throw new Error("FilterValue is empty.");
+    }
+  } else if (action === ACTION_SORT) {
+    rule.sortColumnIndex = toColumnIndex(cell("sortColumnIndex"), "SortColumnIndex");
+
+    const order = isBlank(cell("sortOrder")) ? "ascending" : String(cell("sortOrder")).trim().toLowerCase();
+    if (order !== "ascending" && order !== "descending") {
+      throw new Error(`SortOrder "${order}" is not supported. Use ascending or descending.`);
+    }
+    rule.ascending = order === "ascending";
+  } else if (action === ACTION_SHOW_COLUMNS) {
+    rule.columnChoices = parseColumnChoices(cell("columnChoices"));
+  }
+
+  return rule;
+}
+
+/**
+ * Parses "choice=columns;choice=columns" into a map from choice (trimmed,
+ * case-insensitive) to sheet column numbers (1-based).
+ */
+function parseColumnChoices(value) {
+  const choices = new Map();
+
+  for (const entry of String(value ?? "").split(";")) {
+    if (entry.trim() === "") {
+      continue;
+    }
+
+    const separator = entry.lastIndexOf("=");
+    if (separator <= 0) {
+      throw new Error(`ColumnChoices entry "${entry.trim()}" must look like "choice=E:E,H:H".`);
+    }
+
+    const choice = entry.slice(0, separator).trim().toLowerCase();
+    const columns = new Set();
+    for (const area of parseAddressList(entry.slice(separator + 1))) {
+      for (let column = area.left; column <= area.right; column++) {
+        columns.add(column);
+      }
+    }
+    choices.set(choice, [...columns]);
+  }
+
+  if (choices.size === 0) {
+    throw new Error("ColumnChoices is empty.");
+  }
+
+  return choices;
 }
 
 function parsePlatforms(value) {
@@ -170,6 +232,14 @@ function parsePlatforms(value) {
   }
 
   return platforms.size > 0 ? [...platforms] : ALL_PLATFORMS;
+}
+
+function toColumnIndex(value, header) {
+  const index = toNumber(value);
+  if (!Number.isInteger(index) || index < 0) {
+    throw new Error(`${header} must be a non-negative whole number.`);
+  }
+  return index;
 }
 
 function isBlank(value) {

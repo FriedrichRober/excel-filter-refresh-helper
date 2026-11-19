@@ -42,6 +42,19 @@ export function areasIntersect(firstAreas, secondAreas) {
   );
 }
 
+/**
+ * Converts a 1-based column number to its letters, e.g. 1 -> "A", 28 -> "AB".
+ */
+export function columnLetters(column) {
+  let letters = "";
+
+  for (let rest = column; rest > 0; rest = Math.floor((rest - 1) / 26)) {
+    letters = String.fromCharCode(65 + ((rest - 1) % 26)) + letters;
+  }
+
+  return letters;
+}
+
 function parseArea(part) {
   const address = stripWorksheetPrefix(part).replace(/\$/g, "").toUpperCase().trim();
   const ends = address.split(":");
