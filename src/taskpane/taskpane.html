@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=Edge">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Filter Refresh</title>
+
+    <script
+        type="text/javascript"
+        src="https://appsforoffice.microsoft.com/lib/1/hosted/office.js">
+    </script>
+
+    <link href="taskpane.css" rel="stylesheet" type="text/css">
+</head>
+
+<body>
+    <section id="sideload-msg">
+        <p>Loading Excel add-in...</p>
+    </section>
+
+    <main id="app-body" style="display: none;">
+        <h1>Filter Refresh</h1>
+
+        <p>Refreshes configured worksheet filters after input changes.</p>
+
+        <div class="actions">
+            <button id="run" type="button">Refresh filter</button>
+            <button id="reload" type="button" class="secondary">Reload configuration</button>
+        </div>
+
+        <p id="status" role="status" aria-live="polite"></p>
+        <ul id="problems" hidden></ul>
+    </main>
+</body>
+</html>

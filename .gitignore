@@ -1,0 +1,42 @@
+# Dependencies
+node_modules/
+
+# Build output (deployed to GitHub Pages separately; built with ADDIN_BASE_URL)
+dist/
+
+# Logs and caches
+*.log
+npm-debug.log*
+.eslintcache
+.cache/
+
+# Environment and secrets
+.env
+.env.*
+
+# Local dev certificates
+*.pem
+*.crt
+*.key
+*.pfx
+
+# Workbooks and Office temp files: private data never belongs in this public repo
+*.xlsx
+*.xlsm
+*.xlsb
+*.xls
+~$*
+
+# Screenshots of workbooks
+screenshots/
+
+# Editor and OS files (shared .vscode config stays tracked)
+.vscode/*
+!.vscode/extensions.json
+!.vscode/launch.json
+!.vscode/settings.json
+!.vscode/tasks.json
+.idea/
+Thumbs.db
+Desktop.ini
+.DS_Store
