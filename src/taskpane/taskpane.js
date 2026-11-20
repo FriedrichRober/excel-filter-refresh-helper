@@ -49,9 +49,23 @@ Office.onReady(async (info) => {
   document.getElementById("app-body").style.display = "block";
   document.getElementById("run").onclick = refreshActiveWorksheet;
   document.getElementById("reload").onclick = loadConfiguration;
+  // eslint-disable-next-line no-undef
+  document.getElementById("version").textContent =
+    // eslint-disable-next-line no-undef
+    `Version ${__ADDIN_VERSION__} · built ${formatBuildTime(__BUILD_TIME__)}`;
 
   await loadConfiguration();
 });
+
+// Formats the build timestamp as "YYYY-MM-DD hh:mm" in the viewer's local time.
+function formatBuildTime(ms) {
+  const d = new Date(ms);
+  const pad = (n) => String(n).padStart(2, "0");
+  return (
+    `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ` +
+    `${pad(d.getHours())}:${pad(d.getMinutes())}`
+  );
+}
 
 // ---------------------------------------------------------------------------
 // Configuration

@@ -3,6 +3,19 @@
 const devCerts = require("office-addin-dev-certs");
 const CopyWebpackPlugin = require("copy-webpack-plugin");
 const HtmlWebpackPlugin = require("html-webpack-plugin");
+const fs = require("fs");
+const webpack = require("webpack");
+
+// The add-in version shown in the task pane comes from manifest.xml, the
+// version Office itself uses, so it only has to be bumped in one place.
+function readManifestVersion() {
+  const manifest = fs.readFileSync("./manifest.xml", "utf8");
+  const match = manifest.match(/<Version>([^<]+)<\/Version>/);
+  if (!match) {
+    throw new Error("Could not find <Version> in manifest.xml.");
+  }
+  return match[1].trim();
+}
 
 const urlDev = "https://localhost:3000/";
 // Public HTTPS base URL of the deployed add-in (e.g. the GitHub Pages URL),
@@ -56,6 +69,11 @@ module.exports = async (env, options) => {
       ],
     },
     plugins: [
+      new webpack.DefinePlugin({
+        __ADDIN_VERSION__: JSON.stringify(readManifestVersion()),
+        // Build moment (UTC ms), so each deploy can be told apart in the task pane.
+        __BUILD_TIME__: JSON.stringify(Date.now()),
+      }),
       new HtmlWebpackPlugin({
         filename: "taskpane.html",
         template: "./src/taskpane/taskpane.html",
