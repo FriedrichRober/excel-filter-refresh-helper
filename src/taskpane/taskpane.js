@@ -602,6 +602,7 @@ async function applyRules(worksheetId, rules, timing) {
   const state = getWorksheetState(worksheetId);
   const sortTiming = { sortMs: 0, filterMs: 0 };
   const diagnostics = SORT_DIAGNOSTICS && sortRule ? { steps: [] } : null;
+  let criteriaLost = false;
 
   try {
     await Excel.run(async (context) => {
@@ -613,25 +614,49 @@ async function applyRules(worksheetId, rules, timing) {
       // columns need the protection lifted for the change.
       const needsUnprotect = sortRule !== null || columnRules.length > 0;
 
-      filterRange.load(
-        sortRule
-          ? `isNullObject,columnCount,address${diagnostics ? ",rowCount" : ""}`
-          : "isNullObject,columnCount"
+      const choiceCells = columnRules.map((rule) =>
+        worksheet.getRange(`${columnLetters(rule.watchedAreas[0].left)}${rule.watchedAreas[0].top}`)
       );
-      if (needsUnprotect) {
-        worksheet.protection.load("protected,options");
-      }
-      if (diagnostics) {
-        context.workbook.application.load("calculationMode");
-      }
-      const choiceCells = columnRules.map((rule) => {
-        const area = rule.watchedAreas[0];
-        const cell = worksheet.getRange(`${columnLetters(area.left)}${area.top}`);
-        cell.load("values");
-        return cell;
-      });
+      const queueLoads = (withCriteria) => {
+        filterRange.load(
+          sortRule
+            ? `isNullObject,columnCount,address${diagnostics ? ",rowCount" : ""}`
+            : "isNullObject,columnCount"
+        );
+        if (withCriteria) {
+          autoFilter.load("criteria");
+        }
+        if (needsUnprotect) {
+          worksheet.protection.load("protected,options");
+        }
+        if (diagnostics) {
+          context.workbook.application.load("calculationMode");
+        }
+        choiceCells.forEach((cell) => cell.load("values"));
+      };
+
+      // A sort clears the filters, so the active ones are read to restore them
+      // afterwards. They are loaded with everything else to avoid an extra
+      // round trip. Excel sometimes fails on AutoFilter.criteria with an
+      // internal error; then the load is repeated without them and only the
+      // configured filters are restored.
       const loadStartedAt = performance.now();
-      await context.sync();
+      let activeCriteria = null;
+      if (sortRule) {
+        try {
+          queueLoads(true);
+          await context.sync();
+          activeCriteria = autoFilter.criteria || [];
+        } catch (error) {
+          console.error("Could not read the active filters; restoring only the configured ones.", error, error.debugInfo);
+          criteriaLost = true;
+          queueLoads(false);
+          await context.sync();
+        }
+      } else {
+        queueLoads(false);
+        await context.sync();
+      }
       if (diagnostics) {
         diagnostics.steps.push(`load ${formatMs(performance.now() - loadStartedAt)}`);
         diagnostics.context = [
@@ -661,7 +686,9 @@ async function applyRules(worksheetId, rules, timing) {
           state.ownSortArea = parseAddressList(filterRange.address)[0];
           state.sorting = true;
           try {
-            const filters = configuredFilters(worksheetId, valuesByColumn);
+            const filters = activeCriteria
+              ? filtersToRestore(activeCriteria, valuesByColumn)
+              : configuredFilters(worksheetId, valuesByColumn);
             if (diagnostics) {
               await sortWithDiagnostics(context, autoFilter, filterRange, sortRule, filters, diagnostics);
             } else {
@@ -712,8 +739,11 @@ async function applyRules(worksheetId, rules, timing) {
       parts.push(`sort and filters ${ms(sortTiming.sortMs)}`);
     }
     let text = `${doneText} in ${ms(finishedAt - timing.changedAt)} (${parts.join(", ")}).`;
+    if (criteriaLost) {
+      text += " Excel could not read the active filters, so only the configured filters were applied again.";
+    }
     if (diagnostics) {
-      text += ` Diagnostics: ${diagnostics.steps.join(", ")}. [${diagnostics.context.join(", ")}]`;
+      text += ` Diagnostics:${diagnostics.steps.join(", ")}. [${diagnostics.context.join(", ")}]`;
     }
 
     console.debug(text);
@@ -779,36 +809,85 @@ function showColumns(worksheet, rule, value) {
 }
 
 /**
- * The filters to restore after a sort: every filter-value rule configured for
- * the worksheet, so the filters on other columns come back too. Filters set by
- * hand in Excel are not kept; reading them (AutoFilter.criteria) is slow and
- * often fails with an internal error.
+ * The filters to restore after a sort: the filters active in Excel (including
+ * ones set by hand), with the filter-value rules triggered in this run
+ * replacing the criteria of their columns.
  *
- * @returns {Map<number, Set<string>>} values by filter column index
+ * @returns {Map<number, object>} filter criteria by column index
  */
-function configuredFilters(worksheetId, triggeredValuesByColumn) {
+function filtersToRestore(activeCriteria, triggeredValuesByColumn) {
   const filters = new Map();
 
-  for (const rule of rulesByWorksheetId.get(worksheetId) || []) {
-    if (rule.action === ACTION_FILTER_VALUE) {
-      if (!filters.has(rule.filterColumnIndex)) {
-        filters.set(rule.filterColumnIndex, new Set());
-      }
-      filters.get(rule.filterColumnIndex).add(rule.filterValue);
+  activeCriteria.forEach((criterion, columnIndex) => {
+    const cleaned = cleanCriteria(criterion);
+    if (cleaned) {
+      filters.set(columnIndex, cleaned);
     }
-  }
+  });
 
-  // Rules triggered in this run win, e.g. after a configuration reload.
   for (const [columnIndex, values] of triggeredValuesByColumn) {
-    filters.set(columnIndex, values);
+    filters.set(columnIndex, valuesCriteria(values));
   }
 
   return filters;
 }
 
 /**
+ * Fallback when the active filters cannot be read: every filter-value rule
+ * configured for the worksheet, so the filters on other columns come back too.
+ * Filters set by hand in Excel are lost in this case.
+ *
+ * @returns {Map<number, object>} filter criteria by column index
+ */
+function configuredFilters(worksheetId, triggeredValuesByColumn) {
+  const valuesByColumn = new Map();
+
+  for (const rule of rulesByWorksheetId.get(worksheetId) || []) {
+    if (rule.action === ACTION_FILTER_VALUE) {
+      if (!valuesByColumn.has(rule.filterColumnIndex)) {
+        valuesByColumn.set(rule.filterColumnIndex, new Set());
+      }
+      valuesByColumn.get(rule.filterColumnIndex).add(rule.filterValue);
+    }
+  }
+
+  // Rules triggered in this run win, e.g. after a configuration reload.
+  for (const [columnIndex, values] of triggeredValuesByColumn) {
+    valuesByColumn.set(columnIndex, values);
+  }
+
+  const filters = new Map();
+  for (const [columnIndex, values] of valuesByColumn) {
+    filters.set(columnIndex, valuesCriteria(values));
+  }
+  return filters;
+}
+
+function valuesCriteria(values) {
+  return { filterOn: Excel.FilterOn.values, values: [...values] };
+}
+
+/**
+ * Criteria read from Excel contain empty properties that apply() rejects;
+ * keep only the ones that are set. Returns null for a column without a filter.
+ */
+function cleanCriteria(criterion) {
+  if (!criterion || !criterion.filterOn) {
+    return null;
+  }
+
+  const cleaned = {};
+  for (const [key, value] of Object.entries(criterion)) {
+    if (value !== undefined && value !== null && value !== "") {
+      cleaned[key] = value;
+    }
+  }
+  return cleaned;
+}
+
+/**
  * Excel sorts only the rows a filter shows, so all filters are cleared, the
- * range is sorted and the configured filters are applied again. All of it runs
+ * range is sorted and the saved filters are applied again. All of it runs
  * in one batch; if re-applying fails, each filter is tried on its own, so a
  * failing filter shows more rows instead of stopping the refresh.
  *
@@ -846,9 +925,9 @@ async function sortKeepingFilters(context, autoFilter, filterRange, sortRule, fi
     const filtersStartedAt = performance.now();
     timing.sortMs = filtersStartedAt - startedAt;
 
-    for (const [columnIndex, values] of filters) {
+    for (const [columnIndex, criterion] of filters) {
       try {
-        applyFilters(autoFilter, filterRange, new Map([[columnIndex, values]]));
+        applyFilters(autoFilter, filterRange, new Map([[columnIndex, criterion]]));
         await context.sync();
       } catch (columnError) {
         console.error(`Filter on column index ${columnIndex} could not be applied again.`, columnError);
@@ -883,10 +962,13 @@ async function sortWithDiagnostics(context, autoFilter, filterRange, sortRule, f
     filterRange.sort.apply([{ key: sortRule.sortColumnIndex, ascending: sortRule.ascending }], false, true)
   );
 
-  for (const [columnIndex, values] of filters) {
+  for (const [columnIndex, criterion] of filters) {
+    const label = criterion.values
+      ? pluralize(criterion.values.length, "value")
+      : criterion.filterOn;
     try {
-      await step(`filter col ${columnIndex} (${pluralize(values.size, "value")})`, () =>
-        applyFilters(autoFilter, filterRange, new Map([[columnIndex, values]]))
+      await step(`filter col ${columnIndex} (${label})`, () =>
+        applyFilters(autoFilter, filterRange, new Map([[columnIndex, criterion]]))
       );
     } catch (error) {
       console.error(`Filter on column index ${columnIndex} could not be applied again.`, error);
@@ -901,11 +983,8 @@ function formatMs(value) {
 }
 
 function applyFilters(autoFilter, filterRange, filters) {
-  for (const [columnIndex, values] of filters) {
-    autoFilter.apply(filterRange, columnIndex, {
-      filterOn: Excel.FilterOn.values,
-      values: [...values],
-    });
+  for (const [columnIndex, criterion] of filters) {
+    autoFilter.apply(filterRange, columnIndex, criterion);
   }
 }
 
