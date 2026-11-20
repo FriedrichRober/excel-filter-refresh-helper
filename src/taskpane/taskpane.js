@@ -504,9 +504,15 @@ async function applyRules(worksheetId, rules, startedAt) {
     console.debug(`${doneText}: total ${totalMs} ms, Excel step ${stepMs} ms.`);
     setStatus(`${doneText} in ${totalMs} ms; Excel step ${stepMs} ms.`);
   } catch (error) {
-    console.error(error);
-    setStatus(`Refresh failed: ${error.message}`);
+    console.error(error, error.debugInfo);
+    setStatus(`Refresh failed: ${describeError(error)}`);
   }
+}
+
+/** Adds the failing Excel operation (e.g. "Range.sort.apply") to the message. */
+function describeError(error) {
+  const location = error && error.debugInfo && error.debugInfo.errorLocation;
+  return location ? `${error.message} (${location})` : String(error && error.message);
 }
 
 function validateFilterColumns(filterRange, columnIndexes) {
