@@ -37,6 +37,9 @@ const CALCULATION_FALLBACK_MS = 2000;
 const RELOAD_DEBOUNCE_MS = 300;
 // Change events from the add-in's own sort can arrive shortly after it ends.
 const OWN_SORT_GRACE_MS = 1000;
+// Temporary diagnostics: run each step of a sort in its own sync and report
+// the time of every step. Slower overall; set to false for normal use.
+const SORT_DIAGNOSTICS = true;
 
 /** @type {Map<string, object[]>} rules grouped by worksheet ID */
 let rulesByWorksheetId = new Map();
@@ -598,6 +601,7 @@ async function applyRules(worksheetId, rules, timing) {
 
   const state = getWorksheetState(worksheetId);
   const sortTiming = { sortMs: 0, filterMs: 0 };
+  const diagnostics = SORT_DIAGNOSTICS && sortRule ? { steps: [] } : null;
 
   try {
     await Excel.run(async (context) => {
@@ -609,9 +613,16 @@ async function applyRules(worksheetId, rules, timing) {
       // columns need the protection lifted for the change.
       const needsUnprotect = sortRule !== null || columnRules.length > 0;
 
-      filterRange.load(sortRule ? "isNullObject,columnCount,address" : "isNullObject,columnCount");
+      filterRange.load(
+        sortRule
+          ? `isNullObject,columnCount,address${diagnostics ? ",rowCount" : ""}`
+          : "isNullObject,columnCount"
+      );
       if (needsUnprotect) {
         worksheet.protection.load("protected,options");
+      }
+      if (diagnostics) {
+        context.workbook.application.load("calculationMode");
       }
       const choiceCells = columnRules.map((rule) => {
         const area = rule.watchedAreas[0];
@@ -619,7 +630,16 @@ async function applyRules(worksheetId, rules, timing) {
         cell.load("values");
         return cell;
       });
+      const loadStartedAt = performance.now();
       await context.sync();
+      if (diagnostics) {
+        diagnostics.steps.push(`load ${formatMs(performance.now() - loadStartedAt)}`);
+        diagnostics.context = [
+          `${filterRange.rowCount} rows x ${filterRange.columnCount} columns`,
+          `calculation ${context.workbook.application.calculationMode}`,
+          `protected ${worksheet.protection.protected}`,
+        ];
+      }
 
       if (usesFilter) {
         validateFilterColumns(filterRange, [
@@ -641,14 +661,12 @@ async function applyRules(worksheetId, rules, timing) {
           state.ownSortArea = parseAddressList(filterRange.address)[0];
           state.sorting = true;
           try {
-            await sortKeepingFilters(
-              context,
-              autoFilter,
-              filterRange,
-              sortRule,
-              configuredFilters(worksheetId, valuesByColumn),
-              sortTiming
-            );
+            const filters = configuredFilters(worksheetId, valuesByColumn);
+            if (diagnostics) {
+              await sortWithDiagnostics(context, autoFilter, filterRange, sortRule, filters, diagnostics);
+            } else {
+              await sortKeepingFilters(context, autoFilter, filterRange, sortRule, filters, sortTiming);
+            }
           } finally {
             state.sorting = false;
             state.ownSortIgnoreUntil = performance.now() + OWN_SORT_GRACE_MS;
@@ -669,7 +687,11 @@ async function applyRules(worksheetId, rules, timing) {
         if (protectionOptions) {
           try {
             worksheet.protection.protect(protectionOptions);
+            const protectStartedAt = performance.now();
             await context.sync();
+            if (diagnostics) {
+              diagnostics.steps.push(`protect ${formatMs(performance.now() - protectStartedAt)}`);
+            }
           } catch (error) {
             console.error("Could not protect the worksheet again.", error);
           }
@@ -678,7 +700,7 @@ async function applyRules(worksheetId, rules, timing) {
     });
 
     const finishedAt = performance.now();
-    const ms = (value) => `${Math.round(value)} ms`;
+    const ms = formatMs;
     const parts = [
       `calculation wait ${ms(timing.readyAt - timing.changedAt)}`,
       `queue ${ms(stepStartedAt - timing.readyAt)}`,
@@ -686,10 +708,13 @@ async function applyRules(worksheetId, rules, timing) {
     ];
     if (sortRule && sortTiming.filterMs > 0) {
       parts.push(`sort ${ms(sortTiming.sortMs)}`, `filters one by one ${ms(sortTiming.filterMs)}`);
-    } else if (sortRule) {
+    } else if (sortRule && !diagnostics) {
       parts.push(`sort and filters ${ms(sortTiming.sortMs)}`);
     }
-    const text = `${doneText} in ${ms(finishedAt - timing.changedAt)} (${parts.join(", ")}).`;
+    let text = `${doneText} in ${ms(finishedAt - timing.changedAt)} (${parts.join(", ")}).`;
+    if (diagnostics) {
+      text += ` Diagnostics: ${diagnostics.steps.join(", ")}. [${diagnostics.context.join(", ")}]`;
+    }
 
     console.debug(text);
     setStatus(text);
@@ -828,6 +853,47 @@ async function sortKeepingFilters(context, autoFilter, filterRange, sortRule, fi
   }
 
   timing.filterMs = performance.now() - filtersStartedAt;
+}
+
+/**
+ * Same work as sortKeepingFilters, but every step runs in its own sync so its
+ * time can be measured. An empty sync before and after shows the cost of one
+ * round trip and any work Excel still does after the last step.
+ */
+async function sortWithDiagnostics(context, autoFilter, filterRange, sortRule, filters, diagnostics) {
+  const step = async (name, queue) => {
+    queue();
+    const startedAt = performance.now();
+    try {
+      await context.sync();
+      diagnostics.steps.push(`${name} ${formatMs(performance.now() - startedAt)}`);
+    } catch (error) {
+      diagnostics.steps.push(`${name} FAILED ${formatMs(performance.now() - startedAt)}`);
+      throw error;
+    }
+  };
+
+  await step("empty sync", () => {});
+  await step("clear criteria", () => autoFilter.clearCriteria());
+  await step("sort", () =>
+    filterRange.sort.apply([{ key: sortRule.sortColumnIndex, ascending: sortRule.ascending }], false, true)
+  );
+
+  for (const [columnIndex, values] of filters) {
+    try {
+      await step(`filter col ${columnIndex} (${pluralize(values.size, "value")})`, () =>
+        applyFilters(autoFilter, filterRange, new Map([[columnIndex, values]]))
+      );
+    } catch (error) {
+      console.error(`Filter on column index ${columnIndex} could not be applied again.`, error);
+    }
+  }
+
+  await step("empty sync after", () => {});
+}
+
+function formatMs(value) {
+  return `${Math.round(value)} ms`;
 }
 
 function applyFilters(autoFilter, filterRange, filters) {
