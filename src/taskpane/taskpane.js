@@ -39,7 +39,7 @@ const RELOAD_DEBOUNCE_MS = 300;
 const OWN_SORT_GRACE_MS = 1000;
 // Temporary diagnostics: run each step of a sort in its own sync and report
 // the time of every step. Slower overall; set to false for normal use.
-const SORT_DIAGNOSTICS = true;
+const SORT_DIAGNOSTICS = false;
 
 /** @type {Map<string, object[]>} rules grouped by worksheet ID */
 let rulesByWorksheetId = new Map();
@@ -600,7 +600,7 @@ async function applyRules(worksheetId, rules, timing) {
   setStatus(sortRule ? "Sorting..." : valuesByColumn.size > 0 ? "Refreshing filter..." : "Updating columns...");
 
   const state = getWorksheetState(worksheetId);
-  const sortTiming = { sortMs: 0, filterMs: 0 };
+  const sortTiming = { sortMs: 0, filterMs: 0, recalcMs: null };
   const diagnostics = SORT_DIAGNOSTICS && sortRule ? { steps: [] } : null;
 
   try {
@@ -621,7 +621,7 @@ async function applyRules(worksheetId, rules, timing) {
       if (needsUnprotect) {
         worksheet.protection.load("protected,options");
       }
-      if (diagnostics) {
+      if (sortRule) {
         context.workbook.application.load("calculationMode");
       }
       const choiceCells = columnRules.map((rule) => {
@@ -665,7 +665,8 @@ async function applyRules(worksheetId, rules, timing) {
             if (diagnostics) {
               await sortWithDiagnostics(context, autoFilter, filterRange, sortRule, filters, diagnostics);
             } else {
-              await sortKeepingFilters(context, autoFilter, filterRange, sortRule, filters, sortTiming);
+              const automatic = context.workbook.application.calculationMode === Excel.CalculationMode.automatic;
+              await sortKeepingFilters(context, autoFilter, filterRange, sortRule, filters, sortTiming, automatic);
             }
           } finally {
             state.sorting = false;
@@ -710,6 +711,9 @@ async function applyRules(worksheetId, rules, timing) {
       parts.push(`sort ${ms(sortTiming.sortMs)}`, `filters one by one ${ms(sortTiming.filterMs)}`);
     } else if (sortRule && !diagnostics) {
       parts.push(`sort and filters ${ms(sortTiming.sortMs)}`);
+    }
+    if (sortRule && sortTiming.recalcMs !== null) {
+      parts.push(`recalculation ${ms(sortTiming.recalcMs)}`);
     }
     let text = `${doneText} in ${ms(finishedAt - timing.changedAt)} (${parts.join(", ")}).`;
     if (diagnostics) {
@@ -811,48 +815,65 @@ function configuredFilters(worksheetId, triggeredValuesByColumn) {
  * range is sorted and the configured filters are applied again. All of it runs
  * in one batch; if re-applying fails, each filter is tried on its own, so a
  * failing filter shows more rows instead of stopping the refresh.
+ *
+ * With automatic calculation, calculation is suspended during the batch, so
+ * formulas that depend on the sorted cells are calculated once afterwards
+ * instead of after every step. The add-in then recalculates itself, as
+ * suspendApiCalculationUntilNextSync requires. With manual calculation the
+ * workbook is left as the user set it.
  */
-async function sortKeepingFilters(context, autoFilter, filterRange, sortRule, filters, timing) {
+async function sortKeepingFilters(context, autoFilter, filterRange, sortRule, filters, timing, automatic) {
+  const suspendCalculation = automatic && Office.context.requirements.isSetSupported("ExcelApi", "1.8");
+  const queueClearAndSort = () => {
+    if (suspendCalculation) {
+      context.workbook.application.suspendApiCalculationUntilNextSync();
+    }
+    autoFilter.clearCriteria();
+    filterRange.sort.apply(
+      [{ key: sortRule.sortColumnIndex, ascending: sortRule.ascending }],
+      false,
+      true
+    );
+  };
   const startedAt = performance.now();
 
-  autoFilter.clearCriteria();
-  filterRange.sort.apply(
-    [{ key: sortRule.sortColumnIndex, ascending: sortRule.ascending }],
-    false,
-    true
-  );
-
+  queueClearAndSort();
+  let inOneBatch = true;
   try {
     applyFilters(autoFilter, filterRange, filters);
     await context.sync();
     timing.sortMs = performance.now() - startedAt;
-    return;
   } catch (error) {
     console.error("Sorting and re-applying the filters in one batch failed; retrying in steps.", error, error.debugInfo);
+    inOneBatch = false;
   }
 
-  // Operations after the failing one were not run; repeat them step by step.
-  autoFilter.clearCriteria();
-  filterRange.sort.apply(
-    [{ key: sortRule.sortColumnIndex, ascending: sortRule.ascending }],
-    false,
-    true
-  );
-  await context.sync();
+  if (!inOneBatch) {
+    // Operations after the failing one were not run; repeat them step by step.
+    queueClearAndSort();
+    await context.sync();
 
-  const filtersStartedAt = performance.now();
-  timing.sortMs = filtersStartedAt - startedAt;
+    const filtersStartedAt = performance.now();
+    timing.sortMs = filtersStartedAt - startedAt;
 
-  for (const [columnIndex, values] of filters) {
-    try {
-      applyFilters(autoFilter, filterRange, new Map([[columnIndex, values]]));
-      await context.sync();
-    } catch (columnError) {
-      console.error(`Filter on column index ${columnIndex} could not be applied again.`, columnError);
+    for (const [columnIndex, values] of filters) {
+      try {
+        applyFilters(autoFilter, filterRange, new Map([[columnIndex, values]]));
+        await context.sync();
+      } catch (columnError) {
+        console.error(`Filter on column index ${columnIndex} could not be applied again.`, columnError);
+      }
     }
+
+    timing.filterMs = performance.now() - filtersStartedAt;
   }
 
-  timing.filterMs = performance.now() - filtersStartedAt;
+  if (suspendCalculation) {
+    const recalcStartedAt = performance.now();
+    context.workbook.application.calculate(Excel.CalculationType.recalculate);
+    await context.sync();
+    timing.recalcMs = performance.now() - recalcStartedAt;
+  }
 }
 
 /**
