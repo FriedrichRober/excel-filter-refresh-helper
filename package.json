@@ -1,6 +1,6 @@
 {
   "name": "excel-filter-refresh-helper",
-  "version": "0.0.1",
+  "version": "1.2.0",
   "license": "MIT",
   "config": {
     "app_to_debug": "excel",

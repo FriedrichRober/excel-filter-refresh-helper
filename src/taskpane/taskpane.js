@@ -10,6 +10,12 @@
  *                 filters (after recalculation)
  *   show-columns  shows the columns the watched cell's value selects and hides
  *                 the other columns of the rule (right away)
+ *
+ * reset-on-click rules are triggered by selection instead of change: when the
+ * selection lies entirely inside the watched cells (e.g. a merged "button"
+ * cell), the add-in writes the rule's value into its target cells and selects
+ * the first target cell, so the next click on the button is a new selection.
+ * These rules are not run by the task pane's Run button.
  */
 
 /* global console, document, Excel, Office, performance, window */
@@ -17,6 +23,7 @@
 import { areasInside, areasIntersect, columnLetters, parseAddressList } from "./address";
 import {
   ACTION_FILTER_VALUE,
+  ACTION_RESET_ON_CLICK,
   ACTION_SHOW_COLUMNS,
   ACTION_SORT,
   CONFIG_SHEET_NAME,
@@ -36,6 +43,7 @@ let rulesByWorksheetId = new Map();
 let configurationFound = false;
 
 const registeredWorksheetIds = new Set();
+const selectionRegisteredWorksheetIds = new Set();
 let worksheetAddedHandlerRegistered = false;
 let reloadTimer = null;
 
@@ -130,7 +138,10 @@ async function loadConfiguration() {
     result.errors.forEach((message) => console.error(`Filter refresh configuration: ${message}`));
     setProblems(result.errors);
 
-    await registerEventHandlers([...rulesByWorksheetId.keys()]);
+    await registerEventHandlers(
+      worksheetIdsWithRules(activeRules, (rule) => !isSelectionRule(rule)),
+      worksheetIdsWithRules(activeRules, isSelectionRule)
+    );
 
     const ruleCount = activeRules.length;
     const invalidText =
@@ -192,6 +203,15 @@ function groupRulesByWorksheet(rules) {
   return grouped;
 }
 
+function worksheetIdsWithRules(rules, predicate) {
+  return [...new Set(rules.filter(predicate).map((rule) => rule.worksheetId))];
+}
+
+/** Rules triggered by selecting their watched cells instead of changing them. */
+function isSelectionRule(rule) {
+  return rule.action === ACTION_RESET_ON_CLICK;
+}
+
 function scheduleConfigurationReload() {
   window.clearTimeout(reloadTimer);
   reloadTimer = window.setTimeout(loadConfiguration, RELOAD_DEBOUNCE_MS);
@@ -202,14 +222,23 @@ function scheduleConfigurationReload() {
 // ---------------------------------------------------------------------------
 
 /**
- * Registers change and calculation listeners once per worksheet. Handlers look
- * up rules at event time, so reloading the configuration never needs to
- * re-register listeners for worksheets that already have them.
+ * Registers change and calculation listeners once per worksheet with change
+ * rules, and selection listeners once per worksheet with selection rules.
+ * Handlers look up rules at event time, so reloading the configuration never
+ * needs to re-register listeners for worksheets that already have them.
  */
-async function registerEventHandlers(worksheetIds) {
-  const newIds = worksheetIds.filter((id) => !registeredWorksheetIds.has(id));
+async function registerEventHandlers(changeWorksheetIds, selectionWorksheetIds) {
+  const newIds = changeWorksheetIds.filter((id) => !registeredWorksheetIds.has(id));
+  let newSelectionIds = selectionWorksheetIds.filter(
+    (id) => !selectionRegisteredWorksheetIds.has(id)
+  );
 
-  if (newIds.length === 0 && worksheetAddedHandlerRegistered) {
+  if (newSelectionIds.length > 0 && !Office.context.requirements.isSetSupported("ExcelApi", "1.7")) {
+    console.error("Selection events (ExcelApi 1.7) are not supported; reset-on-click rules are inactive.");
+    newSelectionIds = [];
+  }
+
+  if (newIds.length === 0 && newSelectionIds.length === 0 && worksheetAddedHandlerRegistered) {
     return;
   }
 
@@ -222,6 +251,10 @@ async function registerEventHandlers(worksheetIds) {
       worksheet.onCalculated.add(handleWorksheetCalculated);
     }
 
+    for (const id of newSelectionIds) {
+      worksheets.getItem(id).onSelectionChanged.add(handleWorksheetSelectionChanged);
+    }
+
     if (!worksheetAddedHandlerRegistered) {
       worksheets.onAdded.add(handleWorksheetAdded);
     }
@@ -230,6 +263,7 @@ async function registerEventHandlers(worksheetIds) {
   });
 
   newIds.forEach((id) => registeredWorksheetIds.add(id));
+  newSelectionIds.forEach((id) => selectionRegisteredWorksheetIds.add(id));
   worksheetAddedHandlerRegistered = true;
 }
 
@@ -248,9 +282,12 @@ function waitsForCalculation(rule) {
 }
 
 async function handleWorksheetChanged(event) {
-  const rules = rulesByWorksheetId.get(event.worksheetId);
+  // Selection rules never react to changes, e.g. the writes of reset-on-click.
+  const rules = (rulesByWorksheetId.get(event.worksheetId) || []).filter(
+    (rule) => !isSelectionRule(rule)
+  );
 
-  if (!rules) {
+  if (rules.length === 0) {
     return;
   }
 
@@ -372,6 +409,81 @@ function maxDelay(rules) {
 }
 
 // ---------------------------------------------------------------------------
+// Selection (reset-on-click)
+// ---------------------------------------------------------------------------
+
+async function handleWorksheetSelectionChanged(event) {
+  const rules = (rulesByWorksheetId.get(event.worksheetId) || []).filter(isSelectionRule);
+
+  if (rules.length === 0) {
+    return;
+  }
+
+  let selectedAreas;
+  try {
+    selectedAreas = parseAddressList(event.address);
+  } catch (error) {
+    console.debug(`Ignoring selection with unsupported address: ${error.message}`);
+    return;
+  }
+
+  // Containment, not intersection: selecting the whole sheet, a whole row or
+  // dragging across the button must not trigger it. The add-in's own select()
+  // of a target cell lies outside the button and is ignored here as well.
+  const matchingRules = rules.filter((rule) =>
+    selectedAreas.every((selected) =>
+      rule.watchedAreas.some((watched) => areasInside([selected], watched))
+    )
+  );
+
+  if (matchingRules.length === 0) {
+    return;
+  }
+
+  const state = getWorksheetState(event.worksheetId);
+  if (state.resetting) {
+    return;
+  }
+
+  state.resetting = true;
+  try {
+    await resetTargetCells(event.worksheetId, matchingRules);
+  } finally {
+    state.resetting = false;
+  }
+}
+
+/**
+ * Writes each rule's value into its target cells and selects the first target
+ * cell, moving the selection off the button so the next click fires again.
+ */
+async function resetTargetCells(worksheetId, rules) {
+  const values = new Map();
+  for (const rule of rules) {
+    rule.targetAddresses.forEach((address) => values.set(address, rule.targetValue));
+  }
+  const firstAddress = rules[0].targetAddresses[0];
+
+  try {
+    await Excel.run(async (context) => {
+      const worksheet = context.workbook.worksheets.getItem(worksheetId);
+
+      for (const [address, value] of values) {
+        worksheet.getRange(address).values = [[value]];
+      }
+      worksheet.getRange(firstAddress).select();
+
+      await context.sync();
+    });
+
+    setStatus(`Reset ${pluralize(values.size, "cell")} on ${rules[0].worksheetName}.`);
+  } catch (error) {
+    console.error(error, error.debugInfo);
+    setStatus(`Reset failed: ${describeError(error)}`);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Concurrency
 // ---------------------------------------------------------------------------
 
@@ -389,6 +501,7 @@ function getWorksheetState(worksheetId) {
       queuedRules: new Set(),
       queuedTiming: null,
       sorting: false,
+      resetting: false,
       ownSortArea: null,
       ownSortIgnoreUntil: 0,
     });
@@ -751,9 +864,12 @@ async function refreshActiveWorksheet() {
     return;
   }
 
-  const rules = rulesByWorksheetId.get(worksheetId);
+  // reset-on-click rules only run when their button is clicked.
+  const rules = (rulesByWorksheetId.get(worksheetId) || []).filter(
+    (rule) => !isSelectionRule(rule)
+  );
 
-  if (!rules) {
+  if (rules.length === 0) {
     setStatus("No filter refresh rule is configured for the active worksheet.");
     return;
   }

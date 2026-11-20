@@ -8,7 +8,7 @@
  *   Enabled          TRUE/1 to use the rule
  *   Worksheet        worksheet name
  *   WatchedCells     cells or ranges that trigger the rule, e.g. "B2,B3" or "B2:B4"
- *   Action           filter-value (default), sort or show-columns
+ *   Action           filter-value (default), sort, show-columns or reset-on-click
  *   FilterColumnIndex  filter-value: zero-based column within the AutoFilter range
  *   FilterValue        filter-value: the value to show in that column
  *   SortColumnIndex    sort: zero-based column within the AutoFilter range
@@ -17,15 +17,22 @@
  *                      "Only A=E:E,H:H;Only B=F:F,I:I". When the watched cell holds
  *                      one of the choices, its columns are shown and the columns of
  *                      the other choices are hidden; any other value shows them all.
- *   DelayMs          debounce delay in milliseconds (default 100)
+ *   TargetCells        reset-on-click: single cells to reset, e.g. "B8,F8"
+ *   TargetValue        reset-on-click: the value written into each target cell
+ *   DelayMs          debounce delay in milliseconds (default 100); not used by
+ *                    reset-on-click
  *   Platforms        web, desktop or all (default), e.g. when desktop Excel already
  *                    has its own refresh logic
  *
  * filter-value and sort run after the worksheet has recalculated; sort keeps
  * all filters of the AutoFilter range. show-columns runs right after the change.
+ * reset-on-click is triggered by selecting the watched cells instead of
+ * changing them, so they act as a button (e.g. a merged cell): it writes
+ * TargetValue into every target cell and then selects the first target cell.
+ * It needs no AutoFilter.
  */
 
-import { parseAddressList } from "./address";
+import { columnLetters, parseAddressList } from "./address";
 
 export const CONFIG_SHEET_NAME = "_FilterRefreshConfig";
 export const DEFAULT_DELAY_MS = 100;
@@ -33,7 +40,13 @@ export const DEFAULT_DELAY_MS = 100;
 export const ACTION_FILTER_VALUE = "filter-value";
 export const ACTION_SORT = "sort";
 export const ACTION_SHOW_COLUMNS = "show-columns";
-const SUPPORTED_ACTIONS = [ACTION_FILTER_VALUE, ACTION_SORT, ACTION_SHOW_COLUMNS];
+export const ACTION_RESET_ON_CLICK = "reset-on-click";
+const SUPPORTED_ACTIONS = [
+  ACTION_FILTER_VALUE,
+  ACTION_SORT,
+  ACTION_SHOW_COLUMNS,
+  ACTION_RESET_ON_CLICK,
+];
 
 export const PLATFORM_WEB = "web";
 export const PLATFORM_DESKTOP = "desktop";
@@ -49,6 +62,8 @@ const COLUMNS = {
   sortColumnIndex: { header: "SortColumnIndex" },
   sortOrder: { header: "SortOrder" },
   columnChoices: { header: "ColumnChoices" },
+  targetCells: { header: "TargetCells" },
+  targetValue: { header: "TargetValue" },
   delayMs: { header: "DelayMs" },
   platforms: { header: "Platforms" },
 };
@@ -176,6 +191,14 @@ function buildRule(cell, worksheetsByName) {
     rule.ascending = order === "ascending";
   } else if (action === ACTION_SHOW_COLUMNS) {
     rule.columnChoices = parseColumnChoices(cell("columnChoices"));
+  } else if (action === ACTION_RESET_ON_CLICK) {
+    rule.targetAddresses = parseTargetCells(cell("targetCells"));
+
+    if (isBlank(cell("targetValue"))) {
+      throw new Error("TargetValue is empty.");
+    }
+    // Written as-is, without trimming.
+    rule.targetValue = String(cell("targetValue"));
   }
 
   return rule;
@@ -213,6 +236,20 @@ function parseColumnChoices(value) {
   }
 
   return choices;
+}
+
+/** Parses TargetCells into normalized single-cell addresses, e.g. ["B8", "F8"]. */
+function parseTargetCells(value) {
+  if (isBlank(value)) {
+    throw new Error("TargetCells is empty.");
+  }
+
+  return parseAddressList(value).map((area) => {
+    if (area.top !== area.bottom || area.left !== area.right) {
+      throw new Error("TargetCells must list single cells, e.g. \"B8,F8\".");
+    }
+    return `${columnLetters(area.left)}${area.top}`;
+  });
 }
 
 function parsePlatforms(value) {
