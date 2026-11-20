@@ -14,7 +14,7 @@
 
 /* global console, document, Excel, Office, performance, window */
 
-import { areasIntersect, columnLetters, parseAddressList } from "./address";
+import { areasInside, areasIntersect, columnLetters, parseAddressList } from "./address";
 import {
   ACTION_FILTER_VALUE,
   ACTION_SHOW_COLUMNS,
@@ -28,6 +28,8 @@ import {
 // Run pending rules anyway if no calculation event follows a watched change.
 const CALCULATION_FALLBACK_MS = 2000;
 const RELOAD_DEBOUNCE_MS = 300;
+// Change events from the add-in's own sort can arrive shortly after it ends.
+const OWN_SORT_GRACE_MS = 1000;
 
 /** @type {Map<string, object[]>} rules grouped by worksheet ID */
 let rulesByWorksheetId = new Map();
@@ -260,13 +262,18 @@ async function handleWorksheetChanged(event) {
     return;
   }
 
+  const state = getWorksheetState(event.worksheetId);
+
+  if (isOwnSortChange(state, changedAreas)) {
+    console.debug(`Ignoring change from the add-in's own sort: ${event.address}`);
+    return;
+  }
+
   const matchingRules = rules.filter((rule) => areasIntersect(rule.watchedAreas, changedAreas));
 
   if (matchingRules.length === 0) {
     return;
   }
-
-  const state = getWorksheetState(event.worksheetId);
   const immediateRules = matchingRules.filter((rule) => !waitsForCalculation(rule));
   const calculatedRules = matchingRules.filter(waitsForCalculation);
 
@@ -296,6 +303,29 @@ async function handleWorksheetChanged(event) {
   }
 }
 
+/**
+ * Sorting rewrites the cells of the sorted range, which raises a change event.
+ * If the watched cells lie in that range, the sort would trigger itself again.
+ * While the add-in sorts (and shortly after), changes of more than one cell
+ * inside the sorted range are treated as its own; single-cell edits still count.
+ */
+function isOwnSortChange(state, changedAreas) {
+  if (!state.ownSortArea) {
+    return false;
+  }
+
+  if (!state.sorting && performance.now() > state.ownSortIgnoreUntil) {
+    state.ownSortArea = null;
+    return false;
+  }
+
+  const singleCell = changedAreas.length === 1 &&
+    changedAreas[0].top === changedAreas[0].bottom &&
+    changedAreas[0].left === changedAreas[0].right;
+
+  return !singleCell && areasInside(changedAreas, state.ownSortArea);
+}
+
 async function handleWorksheetCalculated(event) {
   const state = worksheetStates.get(event.worksheetId);
 
@@ -320,7 +350,7 @@ function flushPendingRules(worksheetId) {
   state.pendingRules.clear();
 
   if (rules.length > 0) {
-    runRefresh(worksheetId, rules, state.changedAt);
+    runRefresh(worksheetId, rules, { changedAt: state.changedAt, readyAt: performance.now() });
   }
 }
 
@@ -333,7 +363,7 @@ function flushImmediateRules(worksheetId) {
   state.immediateRules.clear();
 
   if (rules.length > 0) {
-    runRefresh(worksheetId, rules, state.immediateChangedAt);
+    runRefresh(worksheetId, rules, { changedAt: state.immediateChangedAt, readyAt: performance.now() });
   }
 }
 
@@ -357,7 +387,10 @@ function getWorksheetState(worksheetId) {
       immediateTimer: null,
       running: false,
       queuedRules: new Set(),
-      queuedStartedAt: 0,
+      queuedTiming: null,
+      sorting: false,
+      ownSortArea: null,
+      ownSortIgnoreUntil: 0,
     });
   }
 
@@ -376,6 +409,7 @@ function resetPendingWork() {
   for (const state of worksheetStates.values()) {
     clearWaitingWork(state);
     state.queuedRules.clear();
+    state.queuedTiming = null;
   }
 }
 
@@ -384,27 +418,32 @@ function resetPendingWork() {
  * running, later requests are merged into a single queued refresh. Other
  * worksheets are not blocked.
  */
-async function runRefresh(worksheetId, rules, startedAt) {
+async function runRefresh(worksheetId, rules, timing) {
   const state = getWorksheetState(worksheetId);
 
   if (state.running) {
     rules.forEach((rule) => state.queuedRules.add(rule));
-    state.queuedStartedAt = startedAt;
+    // Keep the earliest change so the reported total covers the whole wait.
+    state.queuedTiming = state.queuedTiming
+      ? { changedAt: Math.min(state.queuedTiming.changedAt, timing.changedAt), readyAt: state.queuedTiming.readyAt }
+      : timing;
     return;
   }
 
   state.running = true;
 
   try {
-    await applyRules(worksheetId, rules, startedAt);
+    await applyRules(worksheetId, rules, timing);
   } finally {
     state.running = false;
   }
 
   if (state.queuedRules.size > 0) {
     const queuedRules = [...state.queuedRules];
+    const queuedTiming = state.queuedTiming;
     state.queuedRules.clear();
-    await runRefresh(worksheetId, queuedRules, state.queuedStartedAt);
+    state.queuedTiming = null;
+    await runRefresh(worksheetId, queuedRules, queuedTiming);
   }
 }
 
@@ -412,7 +451,7 @@ async function runRefresh(worksheetId, rules, startedAt) {
 // Actions
 // ---------------------------------------------------------------------------
 
-async function applyRules(worksheetId, rules, startedAt) {
+async function applyRules(worksheetId, rules, timing) {
   // Merge rules: one value filter per column, the last sort rule, and every
   // column rule, so each piece of work is done once.
   const valuesByColumn = new Map();
@@ -444,7 +483,8 @@ async function applyRules(worksheetId, rules, startedAt) {
       : "Columns updated";
   setStatus(sortRule ? "Sorting..." : valuesByColumn.size > 0 ? "Refreshing filter..." : "Updating columns...");
 
-  let criteriaLost = false;
+  const state = getWorksheetState(worksheetId);
+  const sortTiming = { sortMs: 0, filterMs: 0 };
 
   try {
     await Excel.run(async (context) => {
@@ -456,7 +496,7 @@ async function applyRules(worksheetId, rules, startedAt) {
       // columns need the protection lifted for the change.
       const needsUnprotect = sortRule !== null || columnRules.length > 0;
 
-      filterRange.load("isNullObject,columnCount");
+      filterRange.load(sortRule ? "isNullObject,columnCount,address" : "isNullObject,columnCount");
       if (needsUnprotect) {
         worksheet.protection.load("protected,options");
       }
@@ -485,7 +525,21 @@ async function applyRules(worksheetId, rules, startedAt) {
         columnRules.forEach((rule, index) => showColumns(worksheet, rule, choiceCells[index].values[0][0]));
 
         if (sortRule) {
-          criteriaLost = !(await sortKeepingFilters(context, autoFilter, filterRange, sortRule, valuesByColumn));
+          state.ownSortArea = parseAddressList(filterRange.address)[0];
+          state.sorting = true;
+          try {
+            await sortKeepingFilters(
+              context,
+              autoFilter,
+              filterRange,
+              sortRule,
+              configuredFilters(worksheetId, valuesByColumn),
+              sortTiming
+            );
+          } finally {
+            state.sorting = false;
+            state.ownSortIgnoreUntil = performance.now() + OWN_SORT_GRACE_MS;
+          }
         } else {
           // apply() with a column index only replaces that column's criteria;
           // it is much faster than autoFilter.reapply().
@@ -511,16 +565,21 @@ async function applyRules(worksheetId, rules, startedAt) {
     });
 
     const finishedAt = performance.now();
-    const totalMs = Math.round(finishedAt - (startedAt || stepStartedAt));
-    const stepMs = Math.round(finishedAt - stepStartedAt);
+    const ms = (value) => `${Math.round(value)} ms`;
+    const parts = [
+      `calculation wait ${ms(timing.readyAt - timing.changedAt)}`,
+      `queue ${ms(stepStartedAt - timing.readyAt)}`,
+      `Excel step ${ms(finishedAt - stepStartedAt)}`,
+    ];
+    if (sortRule && sortTiming.filterMs > 0) {
+      parts.push(`sort ${ms(sortTiming.sortMs)}`, `filters one by one ${ms(sortTiming.filterMs)}`);
+    } else if (sortRule) {
+      parts.push(`sort and filters ${ms(sortTiming.sortMs)}`);
+    }
+    const text = `${doneText} in ${ms(finishedAt - timing.changedAt)} (${parts.join(", ")}).`;
 
-    console.debug(`${doneText}: total ${totalMs} ms, Excel step ${stepMs} ms.`);
-    setStatus(
-      `${doneText} in ${totalMs} ms; Excel step ${stepMs} ms.` +
-        (criteriaLost
-          ? " Excel could not read the existing filters, so only the configured filters were applied again."
-          : "")
-    );
+    console.debug(text);
+    setStatus(text);
   } catch (error) {
     console.error(error, error.debugInfo);
     setStatus(`Refresh failed: ${describeError(error)}`);
@@ -582,34 +641,59 @@ function showColumns(worksheet, rule, value) {
 }
 
 /**
- * Excel sorts only the rows a filter shows, so the criteria are saved, cleared
- * for the sort and applied again. Columns with a filter-value rule get that
- * rule's value instead of the saved one. A saved criterion that cannot be
- * applied again is skipped, so the sheet shows more rows instead of stopping.
+ * The filters to restore after a sort: every filter-value rule configured for
+ * the worksheet, so the filters on other columns come back too. Filters set by
+ * hand in Excel are not kept; reading them (AutoFilter.criteria) is slow and
+ * often fails with an internal error.
  *
- * Excel sometimes fails to return the criteria (an internal error on
- * AutoFilter.criteria). The criteria are read in their own sync so that this
- * does not stop the refresh; the sort then keeps only the filter-value rules.
- *
- * @returns {Promise<boolean>} false when the saved criteria could not be read.
+ * @returns {Map<number, Set<string>>} values by filter column index
  */
-async function sortKeepingFilters(context, autoFilter, filterRange, sortRule, valuesByColumn) {
-  let criteria = [];
-  let criteriaRead = true;
+function configuredFilters(worksheetId, triggeredValuesByColumn) {
+  const filters = new Map();
+
+  for (const rule of rulesByWorksheetId.get(worksheetId) || []) {
+    if (rule.action === ACTION_FILTER_VALUE) {
+      if (!filters.has(rule.filterColumnIndex)) {
+        filters.set(rule.filterColumnIndex, new Set());
+      }
+      filters.get(rule.filterColumnIndex).add(rule.filterValue);
+    }
+  }
+
+  // Rules triggered in this run win, e.g. after a configuration reload.
+  for (const [columnIndex, values] of triggeredValuesByColumn) {
+    filters.set(columnIndex, values);
+  }
+
+  return filters;
+}
+
+/**
+ * Excel sorts only the rows a filter shows, so all filters are cleared, the
+ * range is sorted and the configured filters are applied again. All of it runs
+ * in one batch; if re-applying fails, each filter is tried on its own, so a
+ * failing filter shows more rows instead of stopping the refresh.
+ */
+async function sortKeepingFilters(context, autoFilter, filterRange, sortRule, filters, timing) {
+  const startedAt = performance.now();
+
+  autoFilter.clearCriteria();
+  filterRange.sort.apply(
+    [{ key: sortRule.sortColumnIndex, ascending: sortRule.ascending }],
+    false,
+    true
+  );
 
   try {
-    autoFilter.load("criteria");
+    applyFilters(autoFilter, filterRange, filters);
     await context.sync();
-    criteria = (autoFilter.criteria || []).map(cleanCriteria);
+    timing.sortMs = performance.now() - startedAt;
+    return;
   } catch (error) {
-    criteriaRead = false;
-    console.error("Could not read the AutoFilter criteria; keeping only the filter-value rules.", error, error.debugInfo);
+    console.error("Sorting and re-applying the filters in one batch failed; retrying in steps.", error, error.debugInfo);
   }
 
-  for (const [columnIndex, values] of valuesByColumn) {
-    criteria[columnIndex] = { filterOn: Excel.FilterOn.values, values: [...values] };
-  }
-
+  // Operations after the failing one were not run; repeat them step by step.
   autoFilter.clearCriteria();
   filterRange.sort.apply(
     [{ key: sortRule.sortColumnIndex, ascending: sortRule.ascending }],
@@ -618,44 +702,28 @@ async function sortKeepingFilters(context, autoFilter, filterRange, sortRule, va
   );
   await context.sync();
 
-  const filtered = [];
-  criteria.forEach((criterion, columnIndex) => {
-    if (criterion) {
-      filtered.push([columnIndex, criterion]);
-      autoFilter.apply(filterRange, columnIndex, criterion);
-    }
-  });
+  const filtersStartedAt = performance.now();
+  timing.sortMs = filtersStartedAt - startedAt;
 
-  try {
-    await context.sync();
-  } catch (error) {
-    console.error("Re-applying the filters at once failed; applying them one by one.", error);
-
-    for (const [columnIndex, criterion] of filtered) {
-      try {
-        autoFilter.apply(filterRange, columnIndex, criterion);
-        await context.sync();
-      } catch (columnError) {
-        console.error(`Filter on column index ${columnIndex} could not be applied again.`, columnError);
-      }
+  for (const [columnIndex, values] of filters) {
+    try {
+      applyFilters(autoFilter, filterRange, new Map([[columnIndex, values]]));
+      await context.sync();
+    } catch (columnError) {
+      console.error(`Filter on column index ${columnIndex} could not be applied again.`, columnError);
     }
   }
 
-  return criteriaRead;
+  timing.filterMs = performance.now() - filtersStartedAt;
 }
 
-function cleanCriteria(criterion) {
-  if (!criterion || !criterion.filterOn) {
-    return null;
+function applyFilters(autoFilter, filterRange, filters) {
+  for (const [columnIndex, values] of filters) {
+    autoFilter.apply(filterRange, columnIndex, {
+      filterOn: Excel.FilterOn.values,
+      values: [...values],
+    });
   }
-
-  const cleaned = {};
-  for (const [key, value] of Object.entries(criterion)) {
-    if (value !== undefined && value !== null && value !== "") {
-      cleaned[key] = value;
-    }
-  }
-  return cleaned;
 }
 
 // ---------------------------------------------------------------------------
@@ -693,7 +761,8 @@ async function refreshActiveWorksheet() {
   // The manual run covers anything still waiting.
   clearWaitingWork(getWorksheetState(worksheetId));
 
-  await runRefresh(worksheetId, rules, performance.now());
+  const now = performance.now();
+  await runRefresh(worksheetId, rules, { changedAt: now, readyAt: now });
 }
 
 // ---------------------------------------------------------------------------

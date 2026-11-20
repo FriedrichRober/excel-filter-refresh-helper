@@ -43,6 +43,19 @@ export function areasIntersect(firstAreas, secondAreas) {
 }
 
 /**
+ * Returns true when every inner area lies completely inside the outer area.
+ */
+export function areasInside(innerAreas, outer) {
+  return innerAreas.every(
+    (inner) =>
+      inner.top >= outer.top &&
+      inner.bottom <= outer.bottom &&
+      inner.left >= outer.left &&
+      inner.right <= outer.right
+  );
+}
+
+/**
  * Converts a 1-based column number to its letters, e.g. 1 -> "A", 28 -> "AB".
  */
 export function columnLetters(column) {
