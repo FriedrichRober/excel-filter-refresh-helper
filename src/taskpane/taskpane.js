@@ -600,7 +600,7 @@ async function applyRules(worksheetId, rules, timing) {
   setStatus(sortRule ? "Sorting..." : valuesByColumn.size > 0 ? "Refreshing filter..." : "Updating columns...");
 
   const state = getWorksheetState(worksheetId);
-  const sortTiming = { sortMs: 0, filterMs: 0, recalcMs: null };
+  const sortTiming = { sortMs: 0, filterMs: 0 };
   const diagnostics = SORT_DIAGNOSTICS && sortRule ? { steps: [] } : null;
 
   try {
@@ -621,7 +621,7 @@ async function applyRules(worksheetId, rules, timing) {
       if (needsUnprotect) {
         worksheet.protection.load("protected,options");
       }
-      if (sortRule) {
+      if (diagnostics) {
         context.workbook.application.load("calculationMode");
       }
       const choiceCells = columnRules.map((rule) => {
@@ -665,8 +665,7 @@ async function applyRules(worksheetId, rules, timing) {
             if (diagnostics) {
               await sortWithDiagnostics(context, autoFilter, filterRange, sortRule, filters, diagnostics);
             } else {
-              const automatic = context.workbook.application.calculationMode === Excel.CalculationMode.automatic;
-              await sortKeepingFilters(context, autoFilter, filterRange, sortRule, filters, sortTiming, automatic);
+              await sortKeepingFilters(context, autoFilter, filterRange, sortRule, filters, sortTiming);
             }
           } finally {
             state.sorting = false;
@@ -711,9 +710,6 @@ async function applyRules(worksheetId, rules, timing) {
       parts.push(`sort ${ms(sortTiming.sortMs)}`, `filters one by one ${ms(sortTiming.filterMs)}`);
     } else if (sortRule && !diagnostics) {
       parts.push(`sort and filters ${ms(sortTiming.sortMs)}`);
-    }
-    if (sortRule && sortTiming.recalcMs !== null) {
-      parts.push(`recalculation ${ms(sortTiming.recalcMs)}`);
     }
     let text = `${doneText} in ${ms(finishedAt - timing.changedAt)} (${parts.join(", ")}).`;
     if (diagnostics) {
@@ -816,18 +812,12 @@ function configuredFilters(worksheetId, triggeredValuesByColumn) {
  * in one batch; if re-applying fails, each filter is tried on its own, so a
  * failing filter shows more rows instead of stopping the refresh.
  *
- * With automatic calculation, calculation is suspended during the batch, so
- * formulas that depend on the sorted cells are calculated once afterwards
- * instead of after every step. The add-in then recalculates itself, as
- * suspendApiCalculationUntilNextSync requires. With manual calculation the
- * workbook is left as the user set it.
+ * Suspending calculation during the batch (suspendApiCalculationUntilNextSync
+ * plus a recalculation afterwards) was measured slower in Excel for the web,
+ * so Excel calculates as it normally would.
  */
-async function sortKeepingFilters(context, autoFilter, filterRange, sortRule, filters, timing, automatic) {
-  const suspendCalculation = automatic && Office.context.requirements.isSetSupported("ExcelApi", "1.8");
+async function sortKeepingFilters(context, autoFilter, filterRange, sortRule, filters, timing) {
   const queueClearAndSort = () => {
-    if (suspendCalculation) {
-      context.workbook.application.suspendApiCalculationUntilNextSync();
-    }
     autoFilter.clearCriteria();
     filterRange.sort.apply(
       [{ key: sortRule.sortColumnIndex, ascending: sortRule.ascending }],
@@ -866,13 +856,6 @@ async function sortKeepingFilters(context, autoFilter, filterRange, sortRule, fi
     }
 
     timing.filterMs = performance.now() - filtersStartedAt;
-  }
-
-  if (suspendCalculation) {
-    const recalcStartedAt = performance.now();
-    context.workbook.application.calculate(Excel.CalculationType.recalculate);
-    await context.sync();
-    timing.recalcMs = performance.now() - recalcStartedAt;
   }
 }
 
