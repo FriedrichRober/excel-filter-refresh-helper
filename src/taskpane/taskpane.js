@@ -430,6 +430,8 @@ async function applyRules(worksheetId, rules, startedAt) {
       : "Columns updated";
   setStatus(sortRule ? "Sorting..." : valuesByColumn.size > 0 ? "Refreshing filter..." : "Updating columns...");
 
+  let criteriaLost = false;
+
   try {
     await Excel.run(async (context) => {
       const worksheet = context.workbook.worksheets.getItem(worksheetId);
@@ -443,9 +445,6 @@ async function applyRules(worksheetId, rules, startedAt) {
       filterRange.load("isNullObject,columnCount");
       if (needsUnprotect) {
         worksheet.protection.load("protected,options");
-      }
-      if (sortRule) {
-        autoFilter.load("criteria");
       }
       const choiceCells = columnRules.map((rule) => {
         const area = rule.watchedAreas[0];
@@ -472,7 +471,7 @@ async function applyRules(worksheetId, rules, startedAt) {
         columnRules.forEach((rule, index) => showColumns(worksheet, rule, choiceCells[index].values[0][0]));
 
         if (sortRule) {
-          await sortKeepingFilters(context, autoFilter, filterRange, sortRule, valuesByColumn);
+          criteriaLost = !(await sortKeepingFilters(context, autoFilter, filterRange, sortRule, valuesByColumn));
         } else {
           // apply() with a column index only replaces that column's criteria;
           // it is much faster than autoFilter.reapply().
@@ -502,7 +501,12 @@ async function applyRules(worksheetId, rules, startedAt) {
     const stepMs = Math.round(finishedAt - stepStartedAt);
 
     console.debug(`${doneText}: total ${totalMs} ms, Excel step ${stepMs} ms.`);
-    setStatus(`${doneText} in ${totalMs} ms; Excel step ${stepMs} ms.`);
+    setStatus(
+      `${doneText} in ${totalMs} ms; Excel step ${stepMs} ms.` +
+        (criteriaLost
+          ? " Excel could not read the existing filters, so only the configured filters were applied again."
+          : "")
+    );
   } catch (error) {
     console.error(error, error.debugInfo);
     setStatus(`Refresh failed: ${describeError(error)}`);
@@ -568,9 +572,25 @@ function showColumns(worksheet, rule, value) {
  * for the sort and applied again. Columns with a filter-value rule get that
  * rule's value instead of the saved one. A saved criterion that cannot be
  * applied again is skipped, so the sheet shows more rows instead of stopping.
+ *
+ * Excel sometimes fails to return the criteria (an internal error on
+ * AutoFilter.criteria). The criteria are read in their own sync so that this
+ * does not stop the refresh; the sort then keeps only the filter-value rules.
+ *
+ * @returns {Promise<boolean>} false when the saved criteria could not be read.
  */
 async function sortKeepingFilters(context, autoFilter, filterRange, sortRule, valuesByColumn) {
-  const criteria = (autoFilter.criteria || []).map(cleanCriteria);
+  let criteria = [];
+  let criteriaRead = true;
+
+  try {
+    autoFilter.load("criteria");
+    await context.sync();
+    criteria = (autoFilter.criteria || []).map(cleanCriteria);
+  } catch (error) {
+    criteriaRead = false;
+    console.error("Could not read the AutoFilter criteria; keeping only the filter-value rules.", error, error.debugInfo);
+  }
 
   for (const [columnIndex, values] of valuesByColumn) {
     criteria[columnIndex] = { filterOn: Excel.FilterOn.values, values: [...values] };
@@ -606,6 +626,8 @@ async function sortKeepingFilters(context, autoFilter, filterRange, sortRule, va
       }
     }
   }
+
+  return criteriaRead;
 }
 
 function cleanCriteria(criterion) {
