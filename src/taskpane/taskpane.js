@@ -16,6 +16,10 @@
  * cell), the add-in writes the rule's value into its target cells and selects
  * the first target cell, so the next click on the button is a new selection.
  * These rules are not run by the task pane's Run button.
+ *
+ * In Excel for the web, the add-in also writes the active column filters of
+ * the worksheets listed in a status worksheet into it (see filterStatus.js),
+ * after every filter change and after its own actions.
  */
 
 /* global console, document, Excel, Office, performance, window */
@@ -27,10 +31,12 @@ import {
   ACTION_SHOW_COLUMNS,
   ACTION_SORT,
   CONFIG_SHEET_NAME,
+  DEFAULT_DELAY_MS,
   PLATFORM_DESKTOP,
   PLATFORM_WEB,
   parseConfiguration,
 } from "./config";
+import { STATUS_SHEET_NAME, formatFilterStatus, parseExcludedColumns, parseStatusRows } from "./filterStatus";
 
 // Run pending rules anyway if no calculation event follows a watched change.
 const CALCULATION_FALLBACK_MS = 2000;
@@ -45,7 +51,12 @@ const SORT_DIAGNOSTICS = false;
 let rulesByWorksheetId = new Map();
 let configurationFound = false;
 
-const registeredWorksheetIds = new Set();
+/** @type {Map<string, number>} 1-based status sheet row by worksheet ID */
+let statusRowsByWorksheetId = new Map();
+
+const changeRegisteredWorksheetIds = new Set();
+const calculatedRegisteredWorksheetIds = new Set();
+const filteredRegisteredWorksheetIds = new Set();
 const selectionRegisteredWorksheetIds = new Set();
 let worksheetAddedHandlerRegistered = false;
 let reloadTimer = null;
@@ -92,37 +103,58 @@ async function loadConfiguration() {
     const result = await Excel.run(async (context) => {
       const worksheets = context.workbook.worksheets;
       const configSheet = worksheets.getItemOrNullObject(CONFIG_SHEET_NAME);
+      const statusSheet = worksheets.getItemOrNullObject(STATUS_SHEET_NAME);
 
       worksheets.load("items/id,items/name");
       configSheet.load("isNullObject");
+      statusSheet.load("isNullObject");
       await context.sync();
 
-      if (configSheet.isNullObject) {
-        return { found: false };
+      const configRange = configSheet.isNullObject ? null : configSheet.getUsedRangeOrNullObject(true);
+      const statusNames = statusSheet.isNullObject
+        ? null
+        : statusSheet.getRange("A:A").getUsedRangeOrNullObject(true);
+      configRange?.load("isNullObject,values,rowIndex");
+      statusNames?.load("isNullObject,values,rowIndex");
+      if (configRange || statusNames) {
+        await context.sync();
       }
-
-      const usedRange = configSheet.getUsedRangeOrNullObject(true);
-      usedRange.load("isNullObject,values,rowIndex");
-      await context.sync();
 
       const sheets = worksheets.items.map((worksheet) => ({
         id: worksheet.id,
         name: worksheet.name,
       }));
 
-      if (usedRange.isNullObject) {
-        return { found: true, rules: [], errors: [] };
+      // Worksheets not listed in the status sheet are ignored.
+      const statusRows = new Map();
+      if (statusNames && !statusNames.isNullObject) {
+        const rowsByName = parseStatusRows(statusNames.values, statusNames.rowIndex + 1);
+        for (const sheet of sheets) {
+          if (rowsByName.has(sheet.name)) {
+            statusRows.set(sheet.id, rowsByName.get(sheet.name));
+          }
+        }
+      }
+
+      if (!configRange) {
+        return { found: false, statusFound: !!statusNames, statusRows };
+      }
+      if (configRange.isNullObject) {
+        return { found: true, statusFound: !!statusNames, statusRows, rules: [], errors: [] };
       }
 
       return {
         found: true,
-        ...parseConfiguration(usedRange.values, sheets, usedRange.rowIndex + 1),
+        statusFound: !!statusNames,
+        statusRows,
+        ...parseConfiguration(configRange.values, sheets, configRange.rowIndex + 1),
       };
     });
 
     // The startup setting is stored in the workbook and shared by all platforms,
-    // so it depends only on the configuration sheet, not on the current platform.
-    await updateStartupBehavior(result.found);
+    // so it depends only on the configuration and status sheets, not on the
+    // current platform.
+    await updateStartupBehavior(result.found || result.statusFound);
 
     resetPendingWork();
     configurationFound = result.found;
@@ -132,6 +164,18 @@ async function loadConfiguration() {
       ? result.rules.filter((rule) => rule.platforms.includes(platform))
       : [];
     rulesByWorksheetId = groupRulesByWorksheet(activeRules);
+    // On desktop, a macro writes the filter status.
+    statusRowsByWorksheetId = platform === PLATFORM_WEB ? result.statusRows : new Map();
+
+    const changeIds = worksheetIdsWithRules(activeRules, (rule) => !isSelectionRule(rule));
+    await registerEventHandlers(
+      changeIds,
+      [...new Set([...changeIds, ...statusRowsByWorksheetId.keys()])],
+      [...statusRowsByWorksheetId.keys()],
+      worksheetIdsWithRules(activeRules, isSelectionRule)
+    );
+    // Bring the status up to date with the filters the workbook was opened with.
+    statusRowsByWorksheetId.forEach((row, worksheetId) => scheduleFilterStatusUpdate(worksheetId));
 
     if (!result.found) {
       setStatus("No filter refresh configuration was found.");
@@ -140,11 +184,6 @@ async function loadConfiguration() {
 
     result.errors.forEach((message) => console.error(`Filter refresh configuration: ${message}`));
     setProblems(result.errors);
-
-    await registerEventHandlers(
-      worksheetIdsWithRules(activeRules, (rule) => !isSelectionRule(rule)),
-      worksheetIdsWithRules(activeRules, isSelectionRule)
-    );
 
     const ruleCount = activeRules.length;
     const invalidText =
@@ -225,33 +264,58 @@ function scheduleConfigurationReload() {
 // ---------------------------------------------------------------------------
 
 /**
- * Registers change and calculation listeners once per worksheet with change
- * rules, and selection listeners once per worksheet with selection rules.
+ * Registers each kind of listener once per worksheet that needs it: change
+ * listeners for worksheets with change rules, calculation listeners for those
+ * and for worksheets listed in the status sheet, filter listeners for listed
+ * worksheets, and selection listeners for worksheets with selection rules.
  * Handlers look up rules at event time, so reloading the configuration never
  * needs to re-register listeners for worksheets that already have them.
  */
-async function registerEventHandlers(changeWorksheetIds, selectionWorksheetIds) {
-  const newIds = changeWorksheetIds.filter((id) => !registeredWorksheetIds.has(id));
-  let newSelectionIds = selectionWorksheetIds.filter(
-    (id) => !selectionRegisteredWorksheetIds.has(id)
-  );
+async function registerEventHandlers(
+  changeWorksheetIds,
+  calculatedWorksheetIds,
+  filteredWorksheetIds,
+  selectionWorksheetIds
+) {
+  const notIn = (registered) => (id) => !registered.has(id);
+  const newChangeIds = changeWorksheetIds.filter(notIn(changeRegisteredWorksheetIds));
+  const newCalculatedIds = calculatedWorksheetIds.filter(notIn(calculatedRegisteredWorksheetIds));
+  // A filter change also recalculates the listed worksheet when its status
+  // formula depends on the visible rows; onFiltered (ExcelApi 1.13) catches
+  // the change even when it does not.
+  const newFilteredIds = Office.context.requirements.isSetSupported("ExcelApi", "1.13")
+    ? filteredWorksheetIds.filter(notIn(filteredRegisteredWorksheetIds))
+    : [];
+  let newSelectionIds = selectionWorksheetIds.filter(notIn(selectionRegisteredWorksheetIds));
 
   if (newSelectionIds.length > 0 && !Office.context.requirements.isSetSupported("ExcelApi", "1.7")) {
     console.error("Selection events (ExcelApi 1.7) are not supported; reset-on-click rules are inactive.");
     newSelectionIds = [];
   }
 
-  if (newIds.length === 0 && newSelectionIds.length === 0 && worksheetAddedHandlerRegistered) {
+  if (
+    newChangeIds.length === 0 &&
+    newCalculatedIds.length === 0 &&
+    newFilteredIds.length === 0 &&
+    newSelectionIds.length === 0 &&
+    worksheetAddedHandlerRegistered
+  ) {
     return;
   }
 
   await Excel.run(async (context) => {
     const worksheets = context.workbook.worksheets;
 
-    for (const id of newIds) {
-      const worksheet = worksheets.getItem(id);
-      worksheet.onChanged.add(handleWorksheetChanged);
-      worksheet.onCalculated.add(handleWorksheetCalculated);
+    for (const id of newChangeIds) {
+      worksheets.getItem(id).onChanged.add(handleWorksheetChanged);
+    }
+
+    for (const id of newCalculatedIds) {
+      worksheets.getItem(id).onCalculated.add(handleWorksheetCalculated);
+    }
+
+    for (const id of newFilteredIds) {
+      worksheets.getItem(id).onFiltered.add(handleWorksheetFiltered);
     }
 
     for (const id of newSelectionIds) {
@@ -265,7 +329,9 @@ async function registerEventHandlers(changeWorksheetIds, selectionWorksheetIds) 
     await context.sync();
   });
 
-  newIds.forEach((id) => registeredWorksheetIds.add(id));
+  newChangeIds.forEach((id) => changeRegisteredWorksheetIds.add(id));
+  newCalculatedIds.forEach((id) => calculatedRegisteredWorksheetIds.add(id));
+  newFilteredIds.forEach((id) => filteredRegisteredWorksheetIds.add(id));
   newSelectionIds.forEach((id) => selectionRegisteredWorksheetIds.add(id));
   worksheetAddedHandlerRegistered = true;
 }
@@ -367,6 +433,8 @@ function isOwnSortChange(state, changedAreas) {
 }
 
 async function handleWorksheetCalculated(event) {
+  scheduleFilterStatusUpdate(event.worksheetId);
+
   const state = worksheetStates.get(event.worksheetId);
 
   if (!state || state.pendingRules.size === 0) {
@@ -500,6 +568,9 @@ function getWorksheetState(worksheetId) {
       immediateRules: new Set(),
       immediateChangedAt: 0,
       immediateTimer: null,
+      statusTimer: null,
+      statusUpdating: false,
+      statusRequested: false,
       running: false,
       queuedRules: new Set(),
       queuedTiming: null,
@@ -519,6 +590,17 @@ function clearWaitingWork(state) {
   window.clearTimeout(state.immediateTimer);
   state.pendingRules.clear();
   state.immediateRules.clear();
+}
+
+/** True while a refresh of the worksheet is running or waiting to run. */
+function hasRefreshWork(state) {
+  return (
+    state.running ||
+    state.sorting ||
+    state.pendingRules.size > 0 ||
+    state.immediateRules.size > 0 ||
+    state.queuedRules.size > 0
+  );
 }
 
 function resetPendingWork() {
@@ -560,7 +642,11 @@ async function runRefresh(worksheetId, rules, timing) {
     state.queuedRules.clear();
     state.queuedTiming = null;
     await runRefresh(worksheetId, queuedRules, queuedTiming);
+    return;
   }
+
+  // The add-in's own filter and sort change the filters too.
+  scheduleFilterStatusUpdate(worksheetId);
 }
 
 // ---------------------------------------------------------------------------
@@ -985,6 +1071,114 @@ function formatMs(value) {
 function applyFilters(autoFilter, filterRange, filters) {
   for (const [columnIndex, criterion] of filters) {
     autoFilter.apply(filterRange, columnIndex, criterion);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Filter status
+// ---------------------------------------------------------------------------
+
+async function handleWorksheetFiltered(event) {
+  scheduleFilterStatusUpdate(event.worksheetId);
+}
+
+/**
+ * Debounces status updates. Several calculation and filter events follow one
+ * filter change, and writing the status causes another calculation; that one
+ * finds the status unchanged and writes nothing, so it does not loop.
+ */
+function scheduleFilterStatusUpdate(worksheetId) {
+  if (!statusRowsByWorksheetId.has(worksheetId)) {
+    return;
+  }
+
+  const state = getWorksheetState(worksheetId);
+  window.clearTimeout(state.statusTimer);
+  state.statusTimer = window.setTimeout(() => runFilterStatusUpdate(worksheetId), DEFAULT_DELAY_MS);
+}
+
+async function runFilterStatusUpdate(worksheetId) {
+  const state = getWorksheetState(worksheetId);
+
+  // The refresh schedules another update when it is done.
+  if (hasRefreshWork(state)) {
+    return;
+  }
+  if (state.statusUpdating) {
+    state.statusRequested = true;
+    return;
+  }
+
+  state.statusUpdating = true;
+  try {
+    await updateFilterStatus(worksheetId);
+  } finally {
+    state.statusUpdating = false;
+  }
+
+  if (state.statusRequested) {
+    state.statusRequested = false;
+    scheduleFilterStatusUpdate(worksheetId);
+  }
+}
+
+/**
+ * Writes the filter text (B) and the visible row count it belongs to (C) into
+ * the worksheet's status row. C is the value of D read after the filters, so
+ * the workbook's formula only shows B while the filters are still the same.
+ * If the filters cannot be read, nothing is written.
+ */
+async function updateFilterStatus(worksheetId) {
+  const row = statusRowsByWorksheetId.get(worksheetId);
+  if (!row) {
+    return;
+  }
+
+  try {
+    await Excel.run(async (context) => {
+      const worksheet = context.workbook.worksheets.getItem(worksheetId);
+      const autoFilter = worksheet.autoFilter;
+      const filterRange = autoFilter.getRangeOrNullObject();
+      const statusRow = context.workbook.worksheets.getItem(STATUS_SHEET_NAME).getRange(`B${row}:E${row}`);
+
+      // Loads run in order: the visible row count (D) is read after the filters.
+      filterRange.load("isNullObject");
+      autoFilter.load("criteria");
+      statusRow.load("values");
+      await context.sync();
+
+      let text = "";
+      if (!filterRange.isNullObject) {
+        const headerRow = filterRange.getRow(0);
+        headerRow.load("values,text");
+        await context.sync();
+
+        // Header text as shown, unless the column is too narrow to show it.
+        const headers = headerRow.values[0].map((value, index) =>
+          typeof value === "string" ? value : headerRow.text[0][index]
+        );
+        const [, , , excludedText] = statusRow.values[0];
+        text = formatFilterStatus(headers, autoFilter.criteria || [], parseExcludedColumns(excludedText));
+      }
+
+      const [writtenText, writtenCount, visibleCount] = statusRow.values[0];
+      if (writtenText === text && writtenCount === visibleCount) {
+        return;
+      }
+      // A refresh may have started meanwhile; it schedules a new update.
+      if (hasRefreshWork(getWorksheetState(worksheetId))) {
+        return;
+      }
+
+      context.workbook.worksheets
+        .getItem(STATUS_SHEET_NAME)
+        .getRange(`B${row}:C${row}`).values = [[text, visibleCount]];
+      await context.sync();
+    });
+  } catch (error) {
+    // E.g. Excel failing on AutoFilter.criteria with an internal error. The
+    // workbook then shows only the row count, so this is not reported.
+    console.debug("Filter status was not updated.", error, error.debugInfo);
   }
 }
 
