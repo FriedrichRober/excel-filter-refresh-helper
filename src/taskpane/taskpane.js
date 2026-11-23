@@ -312,11 +312,10 @@ async function registerEventHandlers(
   const newChangeIds = changeWorksheetIds.filter(notIn(changeRegisteredWorksheetIds));
   const newCalculatedIds = calculatedWorksheetIds.filter(notIn(calculatedRegisteredWorksheetIds));
   // A filter change also recalculates the listed worksheet when its status
-  // formula depends on the visible rows; onFiltered (ExcelApi 1.13) catches
-  // the change even when it does not.
-  const newFilteredIds = Office.context.requirements.isSetSupported("ExcelApi", "1.13")
-    ? filteredWorksheetIds.filter(notIn(filteredRegisteredWorksheetIds))
-    : [];
+  // formula depends on the visible rows; a filter event catches the change
+  // even when it does not. Worksheets have no onFiltered in every Excel
+  // version, so the event is looked up per worksheet (see filterEventOf).
+  const newFilteredIds = filteredWorksheetIds.filter(notIn(filteredRegisteredWorksheetIds));
   let newSelectionIds = selectionWorksheetIds.filter(notIn(selectionRegisteredWorksheetIds));
 
   if (newSelectionIds.length > 0 && !Office.context.requirements.isSetSupported("ExcelApi", "1.7")) {
@@ -346,7 +345,7 @@ async function registerEventHandlers(
     }
 
     for (const id of newFilteredIds) {
-      worksheets.getItem(id).onFiltered.add(handleWorksheetFiltered);
+      filterEventOf(worksheets.getItem(id))?.add(handleWorksheetFiltered);
     }
 
     for (const id of newSelectionIds) {
@@ -365,6 +364,22 @@ async function registerEventHandlers(
   newFilteredIds.forEach((id) => filteredRegisteredWorksheetIds.add(id));
   newSelectionIds.forEach((id) => selectionRegisteredWorksheetIds.add(id));
   worksheetAddedHandlerRegistered = true;
+}
+
+/**
+ * The worksheet event raised when its filter changes: onFiltered where Excel
+ * has it, otherwise onRowHiddenChanged (ExcelApi 1.11), as filtering hides
+ * rows; null when neither exists. Missing events must not stop the other
+ * listeners from being registered.
+ */
+function filterEventOf(worksheet) {
+  if (worksheet.onFiltered) {
+    return worksheet.onFiltered;
+  }
+  if (Office.context.requirements.isSetSupported("ExcelApi", "1.11") && worksheet.onRowHiddenChanged) {
+    return worksheet.onRowHiddenChanged;
+  }
+  return null;
 }
 
 async function handleWorksheetAdded() {
