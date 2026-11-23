@@ -147,6 +147,17 @@ function columnToNumber(letters) {
 }
 
 function stripWorksheetPrefix(part) {
+  return splitWorksheetPrefix(part).address;
+}
+
+/**
+ * Splits "'My sheet'!B2" into its worksheet name ("My sheet", the quotes and
+ * doubled quotes undone) and its address ("B2"); the worksheet is null
+ * without a prefix.
+ * @param {string} part
+ * @returns {{ worksheet: string | null, address: string }}
+ */
+export function splitWorksheetPrefix(part) {
   let inQuotes = false;
   let separatorIndex = -1;
 
@@ -158,7 +169,22 @@ function stripWorksheetPrefix(part) {
     }
   }
 
-  return separatorIndex >= 0 ? part.slice(separatorIndex + 1) : part;
+  if (separatorIndex < 0) {
+    return { worksheet: null, address: part };
+  }
+
+  let worksheet = part.slice(0, separatorIndex).trim();
+  if (worksheet.length >= 2 && worksheet.startsWith("'") && worksheet.endsWith("'")) {
+    worksheet = worksheet.slice(1, -1).replace(/''/g, "'");
+  }
+  return { worksheet, address: part.slice(separatorIndex + 1) };
+}
+
+/** Splits a comma-separated address list into its parts; commas in quoted sheet names stay. */
+export function splitAddressList(text) {
+  return splitOutsideQuotes(String(text ?? ""), ",")
+    .map((part) => part.trim())
+    .filter((part) => part !== "");
 }
 
 function splitOutsideQuotes(text, separator) {

@@ -40,6 +40,7 @@
 import { areasInside, areasIntersect, columnLetters, parseAddressList } from "./address";
 import {
   ACTION_FILTER_VALUE,
+  ACTION_FILTER_TABLE,
   ACTION_MULTI_SELECT_ON_CLICK,
   ACTION_RESET_ON_CLICK,
   ACTION_SHOW_COLUMNS,
@@ -377,7 +378,7 @@ async function handleWorksheetAdded() {
 
 /** Actions that depend on formula results and therefore wait for recalculation. */
 function waitsForCalculation(rule) {
-  return rule.action !== ACTION_SHOW_COLUMNS;
+  return rule.action !== ACTION_SHOW_COLUMNS && rule.action !== ACTION_FILTER_TABLE;
 }
 
 async function handleWorksheetChanged(event) {
@@ -621,15 +622,21 @@ async function handleWorksheetSelectionChanged(event) {
 async function writeClickedTargets(worksheetId, rules) {
   const toggleRules = rules.filter((rule) => rule.action === ACTION_TOGGLE_ON_CLICK);
   const values = new Map();
+  // Toggle targets on other worksheets: name -> (address -> value).
+  const otherValues = new Map();
+  let switchedTo = null;
+  const ownName = rules[0].worksheetName;
   const selectAddress =
     rules[0].action === ACTION_TOGGLE_ON_CLICK ? rules[0].selectAddress : rules[0].targetAddresses[0];
 
   try {
     await Excel.run(async (context) => {
       const worksheet = context.workbook.worksheets.getItem(worksheetId);
+      const sheetNamed = (name) => (name === ownName ? worksheet : context.workbook.worksheets.getItem(name));
 
+      // The first target holds the value the toggle switches from.
       const currentCells = toggleRules.map((rule) => {
-        const range = worksheet.getRange(rule.targetAddresses[0]);
+        const range = sheetNamed(rule.targets[0].worksheetName).getRange(rule.targets[0].address);
         range.load("values");
         return range;
       });
@@ -645,17 +652,40 @@ async function writeClickedTargets(worksheetId, rules) {
       const toggledAreas = [];
       toggleRules.forEach((rule, index) => {
         const value = nextToggleValue(currentCells[index].values[0][0], rule.toggleValues);
-        rule.targetAddresses.forEach((address) => values.set(address, value));
+        switchedTo = switchedTo ?? value;
+        for (const target of rule.targets) {
+          if (target.worksheetName === ownName) {
+            values.set(target.address, value);
+            continue;
+          }
+          if (!otherValues.has(target.worksheetName)) {
+            otherValues.set(target.worksheetName, new Map());
+          }
+          otherValues.get(target.worksheetName).set(target.address, value);
+        }
         toggledAreas.push(...rule.targetAreas);
       });
 
       for (const [address, value] of values) {
         worksheet.getRange(address).values = [[value]];
       }
+      for (const [name, cells] of otherValues) {
+        const sheet = sheetNamed(name);
+        for (const [address, value] of cells) {
+          sheet.getRange(address).values = [[value]];
+        }
+      }
       worksheet.getRange(selectAddress).select();
 
       if (toggledAreas.length > 0) {
         queueWrittenRules(worksheetId, toggledAreas);
+      }
+      // The rules of the other worksheets follow their written cells as well.
+      for (const [name, cells] of otherValues) {
+        const otherId = worksheetIdByName(name);
+        if (otherId !== null) {
+          queueWrittenRules(otherId, parseAddressList([...cells.keys()].join(",")));
+        }
       }
 
       await context.sync();
@@ -670,9 +700,19 @@ async function writeClickedTargets(worksheetId, rules) {
     setStatus(`Reset ${pluralize(values.size, "cell")} on ${rules[0].worksheetName}.`);
   } else if (!hasRefreshWork(getWorksheetState(worksheetId))) {
     // With dependent rules, their progress is shown instead.
-    const address = toggleRules[0].targetAddresses[0];
-    setStatus(`Switched ${address} on ${rules[0].worksheetName} to "${values.get(address)}".`);
+    const others = otherValues.size > 0 ? ` and on ${pluralize(otherValues.size, "other worksheet")}` : "";
+    setStatus(`Switched the toggle on ${ownName}${others} to "${switchedTo}".`);
   }
+}
+
+/** The id of the worksheet named name among those with rules; null when it has none. */
+function worksheetIdByName(name) {
+  for (const [id, rules] of rulesByWorksheetId) {
+    if (rules.some((rule) => rule.worksheetName === name)) {
+      return id;
+    }
+  }
+  return null;
 }
 
 /**
@@ -1033,12 +1073,54 @@ async function runRefresh(worksheetId, rules, timing) {
 // Actions
 // ---------------------------------------------------------------------------
 
+/**
+ * filter-table: for each rule, its table column shows only its values while
+ * the watched cell holds its TargetValue; otherwise the column's filter is
+ * cleared. A slicer on the column follows, as its filter is the table's.
+ */
+async function applyTableFilters(worksheetId, rules) {
+  setStatus("Filtering tables...");
+  try {
+    await Excel.run(async (context) => {
+      const worksheet = context.workbook.worksheets.getItem(worksheetId);
+      const watched = rules.map((rule) => {
+        const range = worksheet.getRange(rule.watchedAddresses).getCell(0, 0);
+        range.load("values");
+        return range;
+      });
+      await context.sync();
+
+      rules.forEach((rule, index) => {
+        const value = String(watched[index].values[0][0] ?? "").trim().toLowerCase();
+        const filter = context.workbook.tables.getItem(rule.tableName).columns.getItem(rule.tableColumn).filter;
+        if (value === rule.filterChoice.toLowerCase()) {
+          filter.applyValuesFilter(rule.tableValues);
+        } else {
+          filter.clear();
+        }
+      });
+      await context.sync();
+    });
+  } catch (error) {
+    console.error(error, error.debugInfo);
+    setStatus(`Table filter failed: ${describeError(error)}`);
+    return;
+  }
+  setStatus(`Filtered ${pluralize(rules.length, "table column")}.`);
+}
+
 async function applyRules(worksheetId, rules, timing) {
   // Merge rules: one value filter per column, the last sort rule, and every
   // column rule, so each piece of work is done once.
   const valuesByColumn = new Map();
   const columnRules = [];
   let sortRule = null;
+
+  // Table filters first: they need no AutoFilter on this worksheet.
+  const tableRules = rules.filter((rule) => rule.action === ACTION_FILTER_TABLE);
+  if (tableRules.length > 0) {
+    await applyTableFilters(worksheetId, tableRules);
+  }
 
   for (const rule of rules) {
     if (rule.action === ACTION_FILTER_VALUE) {

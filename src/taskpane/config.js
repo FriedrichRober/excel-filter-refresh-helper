@@ -8,20 +8,25 @@
  *   Enabled          TRUE/1 to use the rule
  *   Worksheet        worksheet name
  *   WatchedCells     cells or ranges that trigger the rule, e.g. "B2,B3" or "B2:B4"
- *   Action           filter-value (default), sort, show-columns, reset-on-click,
- *                    toggle-on-click or multi-select-on-click
+ *   Action           filter-value (default), sort, show-columns, filter-table,
+ *                    reset-on-click, toggle-on-click or multi-select-on-click
  *   FilterColumnIndex  filter-value: zero-based column within the AutoFilter range
  *   FilterValue        filter-value: the value to show in that column
+ *                      filter-table: the values to show, separated by "|"
  *   SortColumnIndex    sort: zero-based column within the AutoFilter range
  *   SortOrder          sort: ascending (default) or descending
  *   ColumnChoices      show-columns: "choice=columns;choice=columns", e.g.
  *                      "Only A=E:E,H:H;Only B=F:F,I:I". When the watched cell holds
  *                      one of the choices, its columns are shown and the columns of
  *                      the other choices are hidden; any other value shows them all.
- *   TargetCells        reset-on-click, toggle-on-click: single cells to write,
- *                      e.g. "B8,F8"
+ *   TargetCells        filter-table: the table column it filters, "Table[Column]"
+ *                      reset-on-click, toggle-on-click: single cells to write,
+ *                      e.g. "B8,F8"; toggle-on-click also on other worksheets,
+ *                      e.g. "C3,'Other sheet'!D3" (the first holds the value
+ *                      it switches from)
  *                      multi-select-on-click: the one cell to write
- *   TargetValue        reset-on-click: the value written into each target cell
+ *   TargetValue        filter-table: the value of the watched cell that filters
+ *                      reset-on-click: the value written into each target cell
  *                      toggle-on-click: two different values, "first;second"
  *                      multi-select-on-click: the value meaning "every entry",
  *                      also the first entry of the cell's validation list
@@ -53,6 +58,13 @@
  * DelayMs, FilterColumnIndex, FilterValue, SortColumnIndex, SortOrder and
  * ColumnChoices empty.
  *
+ * filter-table runs right after the change, like show-columns: when the watched
+ * cell holds TargetValue, the table column of TargetCells shows only the
+ * values of FilterValue, otherwise its filter is cleared. A slicer on that
+ * column shows the same, as its filter is the table's. The table may lie on
+ * another worksheet, also a hidden one; the watched cell is typically a
+ * toggle-on-click.
+ *
  * multi-select-on-click is triggered by selection as well and opens a popup
  * with one checkbox per entry of the watched cell's data-validation list (the
  * list's first entry, TargetValue, means "every entry" and gets no checkbox).
@@ -62,7 +74,7 @@
  * SelectCell is selected. It leaves the same columns empty as toggle-on-click.
  */
 
-import { areasIntersect, columnLetters, parseAddressList } from "./address";
+import { areasIntersect, columnLetters, parseAddressList, splitAddressList, splitWorksheetPrefix } from "./address";
 
 export const CONFIG_SHEET_NAME = "_FilterRefreshConfig";
 export const DEFAULT_DELAY_MS = 100;
@@ -73,6 +85,9 @@ export const ACTION_SHOW_COLUMNS = "show-columns";
 export const ACTION_RESET_ON_CLICK = "reset-on-click";
 export const ACTION_TOGGLE_ON_CLICK = "toggle-on-click";
 export const ACTION_MULTI_SELECT_ON_CLICK = "multi-select-on-click";
+export const ACTION_FILTER_TABLE = "filter-table";
+// The separator of the values of filter-table in FilterValue.
+export const TABLE_VALUE_SEPARATOR = "|";
 const SUPPORTED_ACTIONS = [
   ACTION_FILTER_VALUE,
   ACTION_SORT,
@@ -80,6 +95,7 @@ const SUPPORTED_ACTIONS = [
   ACTION_RESET_ON_CLICK,
   ACTION_TOGGLE_ON_CLICK,
   ACTION_MULTI_SELECT_ON_CLICK,
+  ACTION_FILTER_TABLE,
 ];
 
 export const PLATFORM_WEB = "web";
@@ -246,14 +262,33 @@ function buildRule(cell, worksheetsByName) {
     // Written as-is, without trimming.
     rule.targetValue = String(cell("targetValue"));
   } else if (action === ACTION_TOGGLE_ON_CLICK) {
-    rule.targetAddresses = parseTargetCells(cell("targetCells"));
-    rule.targetAreas = parseAddressList(rule.targetAddresses.join(","));
+    // Targets may lie on other worksheets ("'Other sheet'!C3"): one click
+    // switches toggles that belong together on several sheets.
+    rule.targets = parseToggleTargets(cell("targetCells"), worksheet.name);
+    rule.targetAddresses = rule.targets
+      .filter((target) => target.worksheetName === worksheet.name)
+      .map((target) => target.address);
+    rule.targetAreas = rule.targetAddresses.length > 0 ? parseAddressList(rule.targetAddresses.join(",")) : [];
     rule.toggleValues = parseToggleValues(cell("targetValue"));
 
     if (!cell.hasColumn("selectCell")) {
       throw new Error(`Configuration column "${COLUMNS.selectCell.header}" is missing; ${ACTION_TOGGLE_ON_CLICK} needs it.`);
     }
     rule.selectAddress = parseSelectCell(cell("selectCell"), watchedAreas);
+  } else if (action === ACTION_FILTER_TABLE) {
+    Object.assign(rule, parseTableColumn(cell("targetCells")));
+
+    rule.filterChoice = String(cell("targetValue") ?? "").trim();
+    if (rule.filterChoice === "") {
+      throw new Error("TargetValue is empty.");
+    }
+    rule.tableValues = String(cell("filterValue") ?? "")
+      .split(TABLE_VALUE_SEPARATOR)
+      .map((part) => part.trim())
+      .filter((part) => part !== "");
+    if (rule.tableValues.length === 0) {
+      throw new Error("FilterValue is empty.");
+    }
   } else if (action === ACTION_MULTI_SELECT_ON_CLICK) {
     rule.targetAddresses = parseTargetCells(cell("targetCells"));
     if (rule.targetAddresses.length !== 1) {
@@ -363,6 +398,15 @@ function parseColumnChoices(value) {
   return choices;
 }
 
+/** Parses "Table[Column]" of filter-table into its table and column names. */
+function parseTableColumn(value) {
+  const match = /^\s*([^[\]]+?)\s*\[\s*([^[\]]+?)\s*\]\s*$/.exec(String(value ?? ""));
+  if (!match) {
+    throw new Error('TargetCells must name a table column, e.g. "Table1[Region]".');
+  }
+  return { tableName: match[1], tableColumn: match[2] };
+}
+
 /** Columns that toggle-on-click and multi-select-on-click must leave empty. */
 const CLICK_UNUSED_COLUMNS = [
   "delayMs",
@@ -417,6 +461,26 @@ function parseTargetCells(value) {
       throw new Error("TargetCells must list single cells, e.g. \"B8,F8\".");
     }
     return `${columnLetters(area.left)}${area.top}`;
+  });
+}
+
+/**
+ * Parses the TargetCells of toggle-on-click: single cells, each on the
+ * rule's worksheet or with a worksheet prefix, e.g. "C3,'Other sheet'!D3".
+ * The first target holds the value the toggle switches from.
+ * @returns {{ worksheetName: string, address: string }[]}
+ */
+function parseToggleTargets(value, worksheetName) {
+  if (isBlank(value)) {
+    throw new Error("TargetCells is empty.");
+  }
+
+  return splitAddressList(value).map((part) => {
+    const { worksheet, address } = splitWorksheetPrefix(part);
+    if (worksheet === "") {
+      throw new Error(`TargetCells has no worksheet name in "${part}".`);
+    }
+    return { worksheetName: worksheet ?? worksheetName, address: parseTargetCells(address)[0] };
   });
 }
 
