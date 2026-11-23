@@ -22,6 +22,12 @@
  * watch the written cells, as if the user had typed the value. It does not
  * wait for the change event of its own write and ignores it if it comes.
  *
+ * multi-select-on-click rules are triggered by selection too: the add-in reads
+ * the entries of the watched cell's data-validation list and opens a popup
+ * (dialog.html) with one checkbox per entry. On OK it writes the ticked entries
+ * (or the rule's "every entry" value) into the target cell and runs the rules
+ * watching it, like toggle-on-click. After OK or Cancel it selects SelectCell.
+ *
  * Selection rules are not run by the task pane's Run button.
  *
  * In Excel for the web, the add-in also writes the active column filters of
@@ -34,6 +40,7 @@
 import { areasInside, areasIntersect, columnLetters, parseAddressList } from "./address";
 import {
   ACTION_FILTER_VALUE,
+  ACTION_MULTI_SELECT_ON_CLICK,
   ACTION_RESET_ON_CLICK,
   ACTION_SHOW_COLUMNS,
   ACTION_SORT,
@@ -42,8 +49,11 @@ import {
   DEFAULT_DELAY_MS,
   PLATFORM_DESKTOP,
   PLATFORM_WEB,
+  initiallySelected,
+  multiSelectValue,
   nextToggleValue,
   parseConfiguration,
+  splitListSource,
 } from "./config";
 import { STATUS_SHEET_NAME, formatFilterStatus, parseExcludedColumns, parseStatusRows } from "./filterStatus";
 
@@ -52,8 +62,11 @@ const CALCULATION_FALLBACK_MS = 2000;
 const RELOAD_DEBOUNCE_MS = 300;
 // Change events from the add-in's own sort can arrive shortly after it ends.
 const OWN_SORT_GRACE_MS = 1000;
-// The change event of the add-in's own toggle write may arrive late, if at all.
-const OWN_TOGGLE_GRACE_MS = 2000;
+// The change event of the add-in's own toggle or popup write may arrive late,
+// if at all.
+const OWN_WRITE_GRACE_MS = 2000;
+// Size of the multi-select popup, in percent of the Excel window.
+const POPUP_SIZE = { width: 30, height: 65 };
 // Temporary diagnostics: run each step of a sort in its own sync and report
 // the time of every step. Slower overall; set to false for normal use.
 const SORT_DIAGNOSTICS = false;
@@ -71,6 +84,8 @@ const filteredRegisteredWorksheetIds = new Set();
 const selectionRegisteredWorksheetIds = new Set();
 let worksheetAddedHandlerRegistered = false;
 let reloadTimer = null;
+// Office shows one dialog at a time; clicks while it is open are ignored.
+let popupOpen = false;
 
 /** Per-worksheet runtime state, keyed by worksheet ID. */
 const worksheetStates = new Map();
@@ -262,7 +277,11 @@ function worksheetIdsWithRules(rules, predicate) {
 
 /** Rules triggered by selecting their watched cells instead of changing them. */
 function isSelectionRule(rule) {
-  return rule.action === ACTION_RESET_ON_CLICK || rule.action === ACTION_TOGGLE_ON_CLICK;
+  return (
+    rule.action === ACTION_RESET_ON_CLICK ||
+    rule.action === ACTION_TOGGLE_ON_CLICK ||
+    rule.action === ACTION_MULTI_SELECT_ON_CLICK
+  );
 }
 
 function scheduleConfigurationReload() {
@@ -300,7 +319,7 @@ async function registerEventHandlers(
   let newSelectionIds = selectionWorksheetIds.filter(notIn(selectionRegisteredWorksheetIds));
 
   if (newSelectionIds.length > 0 && !Office.context.requirements.isSetSupported("ExcelApi", "1.7")) {
-    console.error("Selection events (ExcelApi 1.7) are not supported; reset-on-click and toggle-on-click rules are inactive.");
+    console.error("Selection events (ExcelApi 1.7) are not supported; click rules are inactive.");
     newSelectionIds = [];
   }
 
@@ -386,9 +405,9 @@ async function handleWorksheetChanged(event) {
     return;
   }
 
-  if (isOwnToggleChange(state, changedAreas, event)) {
-    // The toggle already queued the rules watching these cells.
-    console.debug(`Ignoring change from the add-in's own toggle: ${event.address}`);
+  if (isOwnWriteChange(state, changedAreas, event)) {
+    // The toggle or popup already queued the rules watching these cells.
+    console.debug(`Ignoring change from the add-in's own write: ${event.address}`);
     return;
   }
 
@@ -462,17 +481,18 @@ function isOwnSortChange(state, changedAreas) {
 }
 
 /**
- * After a toggle, the add-in has already queued the rules watching the cells
- * it wrote. If Excel raises a change event for that write anyway, it is
- * ignored for a short while, unless Excel says it came from somewhere else.
+ * After a toggle or popup write, the add-in has already queued the rules
+ * watching the cells it wrote. If Excel raises a change event for that write
+ * anyway, it is ignored for a short while, unless Excel says it came from
+ * somewhere else.
  */
-function isOwnToggleChange(state, changedAreas, event) {
-  if (!state.ownToggleAreas) {
+function isOwnWriteChange(state, changedAreas, event) {
+  if (!state.ownWriteAreas) {
     return false;
   }
 
-  if (performance.now() > state.ownToggleIgnoreUntil) {
-    state.ownToggleAreas = null;
+  if (performance.now() > state.ownWriteIgnoreUntil) {
+    state.ownWriteAreas = null;
     return false;
   }
 
@@ -482,7 +502,7 @@ function isOwnToggleChange(state, changedAreas, event) {
   }
 
   return changedAreas.every((changed) =>
-    state.ownToggleAreas.some((written) => areasInside([changed], written))
+    state.ownWriteAreas.some((written) => areasInside([changed], written))
   );
 }
 
@@ -534,7 +554,7 @@ function maxDelay(rules) {
 }
 
 // ---------------------------------------------------------------------------
-// Selection (reset-on-click, toggle-on-click)
+// Selection (reset-on-click, toggle-on-click, multi-select-on-click)
 // ---------------------------------------------------------------------------
 
 async function handleWorksheetSelectionChanged(event) {
@@ -562,7 +582,14 @@ async function handleWorksheetSelectionChanged(event) {
     )
   );
 
-  if (matchingRules.length === 0) {
+  if (matchingRules.length === 0 || popupOpen) {
+    return;
+  }
+
+  // A popup rule is not combined with other click rules on the same cell.
+  const popupRule = matchingRules.find((rule) => rule.action === ACTION_MULTI_SELECT_ON_CLICK);
+  if (popupRule) {
+    await runMultiSelect(event.worksheetId, popupRule);
     return;
   }
 
@@ -628,7 +655,7 @@ async function writeClickedTargets(worksheetId, rules) {
       worksheet.getRange(selectAddress).select();
 
       if (toggledAreas.length > 0) {
-        queueToggledRules(worksheetId, toggledAreas);
+        queueWrittenRules(worksheetId, toggledAreas);
       }
 
       await context.sync();
@@ -648,17 +675,261 @@ async function writeClickedTargets(worksheetId, rules) {
   }
 }
 
-function queueToggledRules(worksheetId, toggledAreas) {
+/**
+ * Queues the change rules watching cells the add-in wrote, as if the value
+ * had been typed, and marks the write so its own change event is ignored.
+ */
+function queueWrittenRules(worksheetId, writtenAreas) {
   const state = getWorksheetState(worksheetId);
-  state.ownToggleAreas = toggledAreas;
-  state.ownToggleIgnoreUntil = performance.now() + OWN_TOGGLE_GRACE_MS;
+  state.ownWriteAreas = writtenAreas;
+  state.ownWriteIgnoreUntil = performance.now() + OWN_WRITE_GRACE_MS;
 
   queueChangedRules(
     worksheetId,
     (rulesByWorksheetId.get(worksheetId) || []).filter(
-      (rule) => !isSelectionRule(rule) && areasIntersect(rule.watchedAreas, toggledAreas)
+      (rule) => !isSelectionRule(rule) && areasIntersect(rule.watchedAreas, writtenAreas)
     )
   );
+}
+
+// ---------------------------------------------------------------------------
+// Multi-select popup (multi-select-on-click)
+// ---------------------------------------------------------------------------
+
+/**
+ * Reads the entries of the watched cell's validation list, opens the popup
+ * and writes the result. If the cell is not set up as the rule expects (e.g.
+ * a list with another input title), nothing opens and the selection stays,
+ * so the cell's own dropdown can still be used.
+ */
+async function runMultiSelect(worksheetId, rule) {
+  if (
+    !Office.context.requirements.isSetSupported("DialogApi", "1.2") ||
+    !Office.context.requirements.isSetSupported("ExcelApi", "1.8")
+  ) {
+    setStatus("This version of Excel cannot show the selection popup (DialogApi 1.2, ExcelApi 1.8).");
+    return;
+  }
+
+  popupOpen = true;
+  try {
+    let list;
+    try {
+      list = await readSelectionList(worksheetId, rule);
+    } catch (error) {
+      console.error(error, error.debugInfo);
+      setStatus(`Selection popup not opened: ${describeError(error)}`);
+      return;
+    }
+
+    let selected;
+    try {
+      selected = await showMultiSelectPopup({
+        title: `${rule.selectionTitle} wählen`,
+        entries: list.entries,
+        selected: initiallySelected(list.currentValue, rule.allValue, list.entries),
+      });
+    } catch (error) {
+      console.error(error);
+      setStatus(error.message);
+      selected = null;
+    }
+
+    const value = selected ? multiSelectValue(selected, rule.allValue, list.entries) : null;
+    await writeMultiSelectResult(worksheetId, rule, value);
+  } finally {
+    popupOpen = false;
+  }
+}
+
+/**
+ * Loads the validation list of the first watched cell and the current value
+ * of the target cell. The list must carry the rule's input title, and its
+ * first entry must be the rule's "every entry" value; the other entries are
+ * the choices.
+ *
+ * @returns {Promise<{ entries: string[], currentValue: any }>}
+ */
+async function readSelectionList(worksheetId, rule) {
+  return Excel.run(async (context) => {
+    const worksheet = context.workbook.worksheets.getItem(worksheetId);
+    const first = rule.watchedAreas[0];
+    const listAddress = `${columnLetters(first.left)}${first.top}`;
+    const validation = worksheet.getRange(listAddress).dataValidation;
+    const target = worksheet.getRange(rule.targetAddresses[0]);
+
+    validation.load("type,rule,prompt");
+    target.load("values");
+    await context.sync();
+
+    const source = validation.type === Excel.DataValidationType.list ? validation.rule?.list?.source : null;
+    if (source === null || source === undefined) {
+      throw new Error(`${listAddress} on ${rule.worksheetName} has no validation list.`);
+    }
+
+    const title = String(validation.prompt?.title ?? "").trim();
+    if (title.toLowerCase() !== rule.selectionTitle.toLowerCase()) {
+      throw new Error(
+        `The validation list of ${listAddress} on ${rule.worksheetName} has the input title ` +
+          `"${title}", not "${rule.selectionTitle}".`
+      );
+    }
+
+    const listed = await readListSource(context, worksheet, String(source));
+    if (listed.length < 2 || listed[0].toLowerCase() !== rule.allValue.toLowerCase()) {
+      throw new Error(
+        `The validation list of ${listAddress} on ${rule.worksheetName} must start with ` +
+          `"${rule.allValue}" and list at least one more entry.`
+      );
+    }
+
+    return { entries: [...new Set(listed.slice(1))], currentValue: target.values[0][0] };
+  });
+}
+
+/**
+ * The entries of a list source: either the entries themselves ("a,b" or
+ * "a;b") or, starting with "=", a reference to a range or a named range
+ * whose cells hold them (Excel limits typed lists to 255 characters).
+ */
+async function readListSource(context, worksheet, source) {
+  if (!source.trim().startsWith("=")) {
+    return splitListSource(source);
+  }
+
+  const reference = source.trim().slice(1).trim();
+  const separator = reference.lastIndexOf("!");
+  let range;
+  if (separator >= 0) {
+    const sheetName = reference
+      .slice(0, separator)
+      .replace(/^'(.*)'$/, "$1")
+      .replace(/''/g, "'");
+    range = context.workbook.worksheets.getItem(sheetName).getRange(reference.slice(separator + 1));
+  } else if (/^\$?[A-Z]{1,3}\$?\d+(:\$?[A-Z]{1,3}\$?\d+)?$/i.test(reference)) {
+    range = worksheet.getRange(reference);
+  } else {
+    range = context.workbook.names.getItem(reference).getRange();
+  }
+
+  range.load("values");
+  try {
+    await context.sync();
+  } catch (error) {
+    throw new Error(`The list source "${source}" could not be read (${error.message}).`);
+  }
+
+  return range.values
+    .flat()
+    .map((value) => String(value ?? "").trim())
+    .filter((value) => value !== "");
+}
+
+/**
+ * Opens the popup and resolves with the ticked entries, or null for Cancel,
+ * Esc or closing the popup. displayInIframe keeps Excel for the web from
+ * treating it as a browser popup window, which could be blocked because the
+ * popup does not open from a click inside the add-in.
+ */
+function showMultiSelectPopup(init) {
+  return new Promise((resolve, reject) => {
+    const url = new URL("dialog.html", window.location.href).href;
+
+    Office.context.ui.displayDialogAsync(url, { ...POPUP_SIZE, displayInIframe: true }, (result) => {
+      if (result.status === Office.AsyncResultStatus.Failed) {
+        reject(new Error(`The selection popup could not be opened: ${result.error.message} (${result.error.code}).`));
+        return;
+      }
+
+      const dialog = result.value;
+      let settled = false;
+      const settle = (callback) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        try {
+          dialog.close();
+        } catch (error) {
+          // Already closed by the user.
+        }
+        callback();
+      };
+
+      dialog.addEventHandler(Office.EventType.DialogMessageReceived, (arg) => {
+        let message;
+        try {
+          message = JSON.parse(arg.message);
+        } catch (error) {
+          return;
+        }
+
+        if (message.type === "ready") {
+          dialog.messageChild(JSON.stringify({ type: "init", ...init }));
+        } else if (message.type === "ok" && Array.isArray(message.selected)) {
+          settle(() => resolve(message.selected.map(String)));
+        } else if (message.type === "cancel") {
+          settle(() => resolve(null));
+        }
+      });
+
+      dialog.addEventHandler(Office.EventType.DialogEventReceived, (arg) => {
+        // 12006: closed by the user, which counts as Cancel.
+        if (arg.error === 12006) {
+          settle(() => resolve(null));
+        } else {
+          settle(() => reject(new Error(`The selection popup failed (${arg.error}).`)));
+        }
+      });
+    });
+  });
+}
+
+/**
+ * Writes the popup's value into the target cell, unless it holds that value
+ * already or the popup was cancelled (value null), and selects SelectCell so
+ * the next click on the watched cell opens the popup again. The rules
+ * watching the target cell are queued before the write is sent, as for
+ * toggle-on-click. The target cell is expected to be unlocked, so the sheet
+ * stays protected.
+ */
+async function writeMultiSelectResult(worksheetId, rule, value) {
+  const address = rule.targetAddresses[0];
+  let written = false;
+
+  try {
+    await Excel.run(async (context) => {
+      const worksheet = context.workbook.worksheets.getItem(worksheetId);
+      const target = worksheet.getRange(address);
+
+      if (value !== null) {
+        target.load("values");
+        await context.sync();
+
+        if (String(target.values[0][0] ?? "").trim() !== value) {
+          target.values = [[value]];
+          written = true;
+        }
+      }
+
+      worksheet.getRange(rule.selectAddress).select();
+      if (written) {
+        queueWrittenRules(worksheetId, rule.targetAreas);
+      }
+
+      await context.sync();
+    });
+  } catch (error) {
+    console.error(error, error.debugInfo);
+    setStatus(`Selection could not be written: ${describeError(error)}`);
+    return;
+  }
+
+  if (written && !hasRefreshWork(getWorksheetState(worksheetId))) {
+    setStatus(`Set ${address} on ${rule.worksheetName} to "${value}".`);
+  } else if (!written) {
+    setStatus(value === null ? "Selection cancelled." : `${address} on ${rule.worksheetName} is unchanged.`);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -685,8 +956,8 @@ function getWorksheetState(worksheetId) {
       clicking: false,
       ownSortArea: null,
       ownSortIgnoreUntil: 0,
-      ownToggleAreas: null,
-      ownToggleIgnoreUntil: 0,
+      ownWriteAreas: null,
+      ownWriteIgnoreUntil: 0,
     });
   }
 
@@ -1316,7 +1587,7 @@ async function refreshActiveWorksheet() {
     return;
   }
 
-  // reset-on-click and toggle-on-click rules only run when their cell is clicked.
+  // Click rules only run when their cell is clicked.
   const rules = (rulesByWorksheetId.get(worksheetId) || []).filter(
     (rule) => !isSelectionRule(rule)
   );

@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+    <meta charset="UTF-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=Edge">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Auswahl</title>
+
+    <script
+        type="text/javascript"
+        src="https://appsforoffice.microsoft.com/lib/1/hosted/office.js">
+    </script>
+
+    <link href="dialog.css" rel="stylesheet" type="text/css">
+</head>
+
+<body>
+    <p id="loading">Laden...</p>
+
+    <main id="picker" hidden>
+        <h1 id="title"></h1>
+
+        <label for="search" class="search-label">Suchen</label>
+        <input id="search" type="search" autocomplete="off" spellcheck="false">
+
+        <div class="summary">
+            <label class="entry select-all">
+                <input id="select-all" type="checkbox">
+                <span>(Alle auswählen)</span>
+            </label>
+            <span id="count" class="count" aria-live="polite"></span>
+        </div>
+
+        <ul id="entries" class="entries"></ul>
+
+        <p id="none-hint" class="none-hint" role="alert" hidden>Mindestens einen Eintrag wählen.</p>
+
+        <div class="buttons">
+            <button id="ok" type="button">OK</button>
+            <button id="cancel" type="button" class="secondary">Abbrechen</button>
+        </div>
+    </main>
+</body>
+</html>

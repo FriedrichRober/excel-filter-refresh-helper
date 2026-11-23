@@ -38,6 +38,8 @@ module.exports = async (env, options) => {
     entry: {
       polyfill: ["core-js/stable", "regenerator-runtime/runtime"],
       taskpane: ["./src/taskpane/taskpane.js", "./src/taskpane/taskpane.html"],
+      // Popup of the multi-select-on-click action, opened from the task pane.
+      dialog: ["./src/dialog/dialog.js", "./src/dialog/dialog.html"],
     },
     output: {
       clean: true,
@@ -78,6 +80,11 @@ module.exports = async (env, options) => {
         filename: "taskpane.html",
         template: "./src/taskpane/taskpane.html",
         chunks: ["polyfill", "taskpane"],
+      }),
+      new HtmlWebpackPlugin({
+        filename: "dialog.html",
+        template: "./src/dialog/dialog.html",
+        chunks: ["polyfill", "dialog"],
       }),
       new CopyWebpackPlugin({
         patterns: [

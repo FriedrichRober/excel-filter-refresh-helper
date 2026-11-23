@@ -8,8 +8,8 @@
  *   Enabled          TRUE/1 to use the rule
  *   Worksheet        worksheet name
  *   WatchedCells     cells or ranges that trigger the rule, e.g. "B2,B3" or "B2:B4"
- *   Action           filter-value (default), sort, show-columns, reset-on-click
- *                    or toggle-on-click
+ *   Action           filter-value (default), sort, show-columns, reset-on-click,
+ *                    toggle-on-click or multi-select-on-click
  *   FilterColumnIndex  filter-value: zero-based column within the AutoFilter range
  *   FilterValue        filter-value: the value to show in that column
  *   SortColumnIndex    sort: zero-based column within the AutoFilter range
@@ -20,13 +20,21 @@
  *                      the other choices are hidden; any other value shows them all.
  *   TargetCells        reset-on-click, toggle-on-click: single cells to write,
  *                      e.g. "B8,F8"
+ *                      multi-select-on-click: the one cell to write
  *   TargetValue        reset-on-click: the value written into each target cell
  *                      toggle-on-click: two different values, "first;second"
- *   SelectCell         toggle-on-click: the single cell selected after the
- *                      toggle; outside WatchedCells. Optional column, only
- *                      needed by toggle-on-click.
+ *                      multi-select-on-click: the value meaning "every entry",
+ *                      also the first entry of the cell's validation list
+ *   SelectCell         toggle-on-click, multi-select-on-click: the single cell
+ *                      selected afterwards; outside WatchedCells. Optional
+ *                      column, only needed by these actions.
+ *   SelectionTitle     multi-select-on-click: the input title (prompt title) of
+ *                      the watched cell's data validation; the popup only opens
+ *                      when the cell carries it, and its heading is built from
+ *                      it. Optional column, only needed by this action.
  *   DelayMs          debounce delay in milliseconds (default 100); not used by
- *                    reset-on-click, must be empty for toggle-on-click
+ *                    reset-on-click, must be empty for toggle-on-click and
+ *                    multi-select-on-click
  *   Platforms        web, desktop or all (default), e.g. when desktop Excel already
  *                    has its own refresh logic
  *
@@ -44,6 +52,14 @@
  * as if the value had been typed. It needs no AutoFilter and must leave
  * DelayMs, FilterColumnIndex, FilterValue, SortColumnIndex, SortOrder and
  * ColumnChoices empty.
+ *
+ * multi-select-on-click is triggered by selection as well and opens a popup
+ * with one checkbox per entry of the watched cell's data-validation list (the
+ * list's first entry, TargetValue, means "every entry" and gets no checkbox).
+ * On OK, the target cell gets TargetValue when every entry is ticked,
+ * otherwise the ticked entries joined by ", " in list order; the other rules
+ * watching it run as if the value had been typed. After OK or Cancel,
+ * SelectCell is selected. It leaves the same columns empty as toggle-on-click.
  */
 
 import { areasIntersect, columnLetters, parseAddressList } from "./address";
@@ -56,12 +72,14 @@ export const ACTION_SORT = "sort";
 export const ACTION_SHOW_COLUMNS = "show-columns";
 export const ACTION_RESET_ON_CLICK = "reset-on-click";
 export const ACTION_TOGGLE_ON_CLICK = "toggle-on-click";
+export const ACTION_MULTI_SELECT_ON_CLICK = "multi-select-on-click";
 const SUPPORTED_ACTIONS = [
   ACTION_FILTER_VALUE,
   ACTION_SORT,
   ACTION_SHOW_COLUMNS,
   ACTION_RESET_ON_CLICK,
   ACTION_TOGGLE_ON_CLICK,
+  ACTION_MULTI_SELECT_ON_CLICK,
 ];
 
 export const PLATFORM_WEB = "web";
@@ -81,6 +99,7 @@ const COLUMNS = {
   targetCells: { header: "TargetCells" },
   targetValue: { header: "TargetValue" },
   selectCell: { header: "SelectCell" },
+  selectionTitle: { header: "SelectionTitle" },
   delayMs: { header: "DelayMs" },
   platforms: { header: "Platforms" },
 };
@@ -171,11 +190,11 @@ function buildRule(cell, worksheetsByName) {
     }
   }
 
-  if (action === ACTION_TOGGLE_ON_CLICK) {
+  if (action === ACTION_TOGGLE_ON_CLICK || action === ACTION_MULTI_SELECT_ON_CLICK) {
     // Validated before DelayMs is parsed, so a wrong DelayMs gets this message.
-    for (const key of TOGGLE_UNUSED_COLUMNS) {
+    for (const key of CLICK_UNUSED_COLUMNS) {
       if (!isBlank(cell(key))) {
-        throw new Error(`${COLUMNS[key].header} must be empty for ${ACTION_TOGGLE_ON_CLICK}.`);
+        throw new Error(`${COLUMNS[key].header} must be empty for ${action}.`);
       }
     }
   }
@@ -235,6 +254,29 @@ function buildRule(cell, worksheetsByName) {
       throw new Error(`Configuration column "${COLUMNS.selectCell.header}" is missing; ${ACTION_TOGGLE_ON_CLICK} needs it.`);
     }
     rule.selectAddress = parseSelectCell(cell("selectCell"), watchedAreas);
+  } else if (action === ACTION_MULTI_SELECT_ON_CLICK) {
+    rule.targetAddresses = parseTargetCells(cell("targetCells"));
+    if (rule.targetAddresses.length !== 1) {
+      throw new Error(`TargetCells must be a single cell for ${action}.`);
+    }
+    rule.targetAreas = parseAddressList(rule.targetAddresses[0]);
+
+    rule.allValue = String(cell("targetValue") ?? "").trim();
+    if (rule.allValue === "") {
+      throw new Error("TargetValue is empty.");
+    }
+
+    for (const key of ["selectCell", "selectionTitle"]) {
+      if (!cell.hasColumn(key)) {
+        throw new Error(`Configuration column "${COLUMNS[key].header}" is missing; ${action} needs it.`);
+      }
+    }
+    rule.selectAddress = parseSelectCell(cell("selectCell"), watchedAreas);
+
+    rule.selectionTitle = String(cell("selectionTitle") ?? "").trim();
+    if (rule.selectionTitle === "") {
+      throw new Error("SelectionTitle is empty.");
+    }
   }
 
   return rule;
@@ -248,6 +290,43 @@ function buildRule(cell, worksheetsByName) {
 export function nextToggleValue(currentValue, toggleValues) {
   const current = String(currentValue ?? "").trim().toLowerCase();
   return current === toggleValues[0].toLowerCase() ? toggleValues[1] : toggleValues[0];
+}
+
+/**
+ * Splits a data-validation list source ("a,b,c" or "a;b;c") into its trimmed,
+ * non-empty entries.
+ */
+export function splitListSource(source) {
+  return String(source ?? "")
+    .split(/[,;]/)
+    .map((entry) => entry.trim())
+    .filter((entry) => entry !== "");
+}
+
+/**
+ * The entries ticked when the popup opens for a cell value: the entries the
+ * value names (comma-separated, case ignored), or all of them when the value
+ * is the "every entry" value or names none of them.
+ */
+export function initiallySelected(cellValue, allValue, entries) {
+  const text = String(cellValue ?? "").trim().toLowerCase();
+  if (text === allValue.toLowerCase()) {
+    return [...entries];
+  }
+
+  const named = new Set(splitListSource(text));
+  const selected = entries.filter((entry) => named.has(entry.toLowerCase()));
+  return selected.length > 0 ? selected : [...entries];
+}
+
+/**
+ * The value written for the ticked entries: allValue when every entry is
+ * ticked, otherwise the ticked entries joined by ", " in list order.
+ */
+export function multiSelectValue(selected, allValue, entries) {
+  const ticked = new Set(selected);
+  const inOrder = entries.filter((entry) => ticked.has(entry));
+  return inOrder.length === entries.length ? allValue : inOrder.join(", ");
 }
 
 /**
@@ -284,8 +363,8 @@ function parseColumnChoices(value) {
   return choices;
 }
 
-/** Columns that toggle-on-click does not use and that must stay empty. */
-const TOGGLE_UNUSED_COLUMNS = [
+/** Columns that toggle-on-click and multi-select-on-click must leave empty. */
+const CLICK_UNUSED_COLUMNS = [
   "delayMs",
   "filterColumnIndex",
   "filterValue",
