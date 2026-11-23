@@ -8,7 +8,8 @@
  *   Enabled          TRUE/1 to use the rule
  *   Worksheet        worksheet name
  *   WatchedCells     cells or ranges that trigger the rule, e.g. "B2,B3" or "B2:B4"
- *   Action           filter-value (default), sort, show-columns or reset-on-click
+ *   Action           filter-value (default), sort, show-columns, reset-on-click
+ *                    or toggle-on-click
  *   FilterColumnIndex  filter-value: zero-based column within the AutoFilter range
  *   FilterValue        filter-value: the value to show in that column
  *   SortColumnIndex    sort: zero-based column within the AutoFilter range
@@ -17,10 +18,15 @@
  *                      "Only A=E:E,H:H;Only B=F:F,I:I". When the watched cell holds
  *                      one of the choices, its columns are shown and the columns of
  *                      the other choices are hidden; any other value shows them all.
- *   TargetCells        reset-on-click: single cells to reset, e.g. "B8,F8"
+ *   TargetCells        reset-on-click, toggle-on-click: single cells to write,
+ *                      e.g. "B8,F8"
  *   TargetValue        reset-on-click: the value written into each target cell
+ *                      toggle-on-click: two different values, "first;second"
+ *   SelectCell         toggle-on-click: the single cell selected after the
+ *                      toggle; outside WatchedCells. Optional column, only
+ *                      needed by toggle-on-click.
  *   DelayMs          debounce delay in milliseconds (default 100); not used by
- *                    reset-on-click
+ *                    reset-on-click, must be empty for toggle-on-click
  *   Platforms        web, desktop or all (default), e.g. when desktop Excel already
  *                    has its own refresh logic
  *
@@ -30,9 +36,17 @@
  * changing them, so they act as a button (e.g. a merged cell): it writes
  * TargetValue into every target cell and then selects the first target cell.
  * It needs no AutoFilter.
+ *
+ * toggle-on-click is triggered by selection as well, so the watched cells act
+ * as an on/off switch: if the first target cell holds the first value of
+ * TargetValue, every target cell gets the second value, otherwise the first.
+ * Then SelectCell is selected. The other rules watching the written cells run
+ * as if the value had been typed. It needs no AutoFilter and must leave
+ * DelayMs, FilterColumnIndex, FilterValue, SortColumnIndex, SortOrder and
+ * ColumnChoices empty.
  */
 
-import { columnLetters, parseAddressList } from "./address";
+import { areasIntersect, columnLetters, parseAddressList } from "./address";
 
 export const CONFIG_SHEET_NAME = "_FilterRefreshConfig";
 export const DEFAULT_DELAY_MS = 100;
@@ -41,11 +55,13 @@ export const ACTION_FILTER_VALUE = "filter-value";
 export const ACTION_SORT = "sort";
 export const ACTION_SHOW_COLUMNS = "show-columns";
 export const ACTION_RESET_ON_CLICK = "reset-on-click";
+export const ACTION_TOGGLE_ON_CLICK = "toggle-on-click";
 const SUPPORTED_ACTIONS = [
   ACTION_FILTER_VALUE,
   ACTION_SORT,
   ACTION_SHOW_COLUMNS,
   ACTION_RESET_ON_CLICK,
+  ACTION_TOGGLE_ON_CLICK,
 ];
 
 export const PLATFORM_WEB = "web";
@@ -64,6 +80,7 @@ const COLUMNS = {
   columnChoices: { header: "ColumnChoices" },
   targetCells: { header: "TargetCells" },
   targetValue: { header: "TargetValue" },
+  selectCell: { header: "SelectCell" },
   delayMs: { header: "DelayMs" },
   platforms: { header: "Platforms" },
 };
@@ -113,6 +130,7 @@ export function parseConfiguration(values, worksheets, firstRowNumber = 1) {
     }
 
     const cell = (key) => (columnIndexes[key] >= 0 ? row[columnIndexes[key]] : "");
+    cell.hasColumn = (key) => columnIndexes[key] >= 0;
 
     if (!isTrue(cell("enabled"))) {
       continue;
@@ -150,6 +168,15 @@ function buildRule(cell, worksheetsByName) {
     action = String(cell("action")).trim().toLowerCase();
     if (!SUPPORTED_ACTIONS.includes(action)) {
       throw new Error(`Action "${action}" is not supported. Use ${SUPPORTED_ACTIONS.join(", ")}.`);
+    }
+  }
+
+  if (action === ACTION_TOGGLE_ON_CLICK) {
+    // Validated before DelayMs is parsed, so a wrong DelayMs gets this message.
+    for (const key of TOGGLE_UNUSED_COLUMNS) {
+      if (!isBlank(cell(key))) {
+        throw new Error(`${COLUMNS[key].header} must be empty for ${ACTION_TOGGLE_ON_CLICK}.`);
+      }
     }
   }
 
@@ -199,9 +226,28 @@ function buildRule(cell, worksheetsByName) {
     }
     // Written as-is, without trimming.
     rule.targetValue = String(cell("targetValue"));
+  } else if (action === ACTION_TOGGLE_ON_CLICK) {
+    rule.targetAddresses = parseTargetCells(cell("targetCells"));
+    rule.targetAreas = parseAddressList(rule.targetAddresses.join(","));
+    rule.toggleValues = parseToggleValues(cell("targetValue"));
+
+    if (!cell.hasColumn("selectCell")) {
+      throw new Error(`Configuration column "${COLUMNS.selectCell.header}" is missing; ${ACTION_TOGGLE_ON_CLICK} needs it.`);
+    }
+    rule.selectAddress = parseSelectCell(cell("selectCell"), watchedAreas);
   }
 
   return rule;
+}
+
+/**
+ * The value a toggle-on-click rule writes: the second value when the current
+ * value is the first one (ignoring case and surrounding spaces), otherwise the
+ * first value.
+ */
+export function nextToggleValue(currentValue, toggleValues) {
+  const current = String(currentValue ?? "").trim().toLowerCase();
+  return current === toggleValues[0].toLowerCase() ? toggleValues[1] : toggleValues[0];
 }
 
 /**
@@ -236,6 +282,49 @@ function parseColumnChoices(value) {
   }
 
   return choices;
+}
+
+/** Columns that toggle-on-click does not use and that must stay empty. */
+const TOGGLE_UNUSED_COLUMNS = [
+  "delayMs",
+  "filterColumnIndex",
+  "filterValue",
+  "sortColumnIndex",
+  "sortOrder",
+  "columnChoices",
+];
+
+/** Parses "first;second" into two trimmed values that differ (ignoring case). */
+function parseToggleValues(value) {
+  const values = String(value ?? "")
+    .split(";")
+    .map((part) => part.trim());
+
+  if (values.length !== 2 || values.some((part) => part === "")) {
+    throw new Error('TargetValue must hold exactly two values separated by ";", e.g. "On;Off".');
+  }
+  if (values[0].toLowerCase() === values[1].toLowerCase()) {
+    throw new Error("The two values of TargetValue must be different.");
+  }
+
+  return values;
+}
+
+/** Parses SelectCell into one normalized address outside the watched cells. */
+function parseSelectCell(value, watchedAreas) {
+  if (isBlank(value)) {
+    throw new Error("SelectCell is empty.");
+  }
+
+  const areas = parseAddressList(value);
+  if (areas.length !== 1 || areas[0].top !== areas[0].bottom || areas[0].left !== areas[0].right) {
+    throw new Error('SelectCell must be a single cell, e.g. "A1".');
+  }
+  if (areasIntersect(areas, watchedAreas)) {
+    throw new Error("SelectCell must lie outside WatchedCells.");
+  }
+
+  return `${columnLetters(areas[0].left)}${areas[0].top}`;
 }
 
 /** Parses TargetCells into normalized single-cell addresses, e.g. ["B8", "F8"]. */

@@ -15,7 +15,14 @@
  * selection lies entirely inside the watched cells (e.g. a merged "button"
  * cell), the add-in writes the rule's value into its target cells and selects
  * the first target cell, so the next click on the button is a new selection.
- * These rules are not run by the task pane's Run button.
+ *
+ * toggle-on-click rules are triggered by selection too: the add-in switches
+ * the target cells between the rule's two values (the first target cell
+ * decides), selects the rule's SelectCell and then runs the other rules that
+ * watch the written cells, as if the user had typed the value. It does not
+ * wait for the change event of its own write and ignores it if it comes.
+ *
+ * Selection rules are not run by the task pane's Run button.
  *
  * In Excel for the web, the add-in also writes the active column filters of
  * the worksheets listed in a status worksheet into it (see filterStatus.js),
@@ -30,10 +37,12 @@ import {
   ACTION_RESET_ON_CLICK,
   ACTION_SHOW_COLUMNS,
   ACTION_SORT,
+  ACTION_TOGGLE_ON_CLICK,
   CONFIG_SHEET_NAME,
   DEFAULT_DELAY_MS,
   PLATFORM_DESKTOP,
   PLATFORM_WEB,
+  nextToggleValue,
   parseConfiguration,
 } from "./config";
 import { STATUS_SHEET_NAME, formatFilterStatus, parseExcludedColumns, parseStatusRows } from "./filterStatus";
@@ -43,6 +52,8 @@ const CALCULATION_FALLBACK_MS = 2000;
 const RELOAD_DEBOUNCE_MS = 300;
 // Change events from the add-in's own sort can arrive shortly after it ends.
 const OWN_SORT_GRACE_MS = 1000;
+// The change event of the add-in's own toggle write may arrive late, if at all.
+const OWN_TOGGLE_GRACE_MS = 2000;
 // Temporary diagnostics: run each step of a sort in its own sync and report
 // the time of every step. Slower overall; set to false for normal use.
 const SORT_DIAGNOSTICS = false;
@@ -251,7 +262,7 @@ function worksheetIdsWithRules(rules, predicate) {
 
 /** Rules triggered by selecting their watched cells instead of changing them. */
 function isSelectionRule(rule) {
-  return rule.action === ACTION_RESET_ON_CLICK;
+  return rule.action === ACTION_RESET_ON_CLICK || rule.action === ACTION_TOGGLE_ON_CLICK;
 }
 
 function scheduleConfigurationReload() {
@@ -289,7 +300,7 @@ async function registerEventHandlers(
   let newSelectionIds = selectionWorksheetIds.filter(notIn(selectionRegisteredWorksheetIds));
 
   if (newSelectionIds.length > 0 && !Office.context.requirements.isSetSupported("ExcelApi", "1.7")) {
-    console.error("Selection events (ExcelApi 1.7) are not supported; reset-on-click rules are inactive.");
+    console.error("Selection events (ExcelApi 1.7) are not supported; reset-on-click and toggle-on-click rules are inactive.");
     newSelectionIds = [];
   }
 
@@ -375,11 +386,29 @@ async function handleWorksheetChanged(event) {
     return;
   }
 
-  const matchingRules = rules.filter((rule) => areasIntersect(rule.watchedAreas, changedAreas));
+  if (isOwnToggleChange(state, changedAreas, event)) {
+    // The toggle already queued the rules watching these cells.
+    console.debug(`Ignoring change from the add-in's own toggle: ${event.address}`);
+    return;
+  }
 
+  queueChangedRules(
+    event.worksheetId,
+    rules.filter((rule) => areasIntersect(rule.watchedAreas, changedAreas))
+  );
+}
+
+/**
+ * Queues change rules as after a change of their watched cells: rules that
+ * wait for calculation run after the next calculation (or the fallback), the
+ * others after their delay. Rules already waiting are merged, not repeated.
+ */
+function queueChangedRules(worksheetId, matchingRules) {
   if (matchingRules.length === 0) {
     return;
   }
+
+  const state = getWorksheetState(worksheetId);
   const immediateRules = matchingRules.filter((rule) => !waitsForCalculation(rule));
   const calculatedRules = matchingRules.filter(waitsForCalculation);
 
@@ -389,7 +418,7 @@ async function handleWorksheetChanged(event) {
 
     window.clearTimeout(state.immediateTimer);
     state.immediateTimer = window.setTimeout(
-      () => flushImmediateRules(event.worksheetId),
+      () => flushImmediateRules(worksheetId),
       maxDelay(state.immediateRules)
     );
   }
@@ -401,7 +430,7 @@ async function handleWorksheetChanged(event) {
     window.clearTimeout(state.debounceTimer);
     window.clearTimeout(state.fallbackTimer);
     state.fallbackTimer = window.setTimeout(
-      () => flushPendingRules(event.worksheetId),
+      () => flushPendingRules(worksheetId),
       CALCULATION_FALLBACK_MS
     );
 
@@ -430,6 +459,31 @@ function isOwnSortChange(state, changedAreas) {
     changedAreas[0].left === changedAreas[0].right;
 
   return !singleCell && areasInside(changedAreas, state.ownSortArea);
+}
+
+/**
+ * After a toggle, the add-in has already queued the rules watching the cells
+ * it wrote. If Excel raises a change event for that write anyway, it is
+ * ignored for a short while, unless Excel says it came from somewhere else.
+ */
+function isOwnToggleChange(state, changedAreas, event) {
+  if (!state.ownToggleAreas) {
+    return false;
+  }
+
+  if (performance.now() > state.ownToggleIgnoreUntil) {
+    state.ownToggleAreas = null;
+    return false;
+  }
+
+  // triggerSource (ExcelApi 1.14) is "ThisLocalAddin" for the add-in's write.
+  if (event.triggerSource !== undefined && event.triggerSource !== "ThisLocalAddin") {
+    return false;
+  }
+
+  return changedAreas.every((changed) =>
+    state.ownToggleAreas.some((written) => areasInside([changed], written))
+  );
 }
 
 async function handleWorksheetCalculated(event) {
@@ -480,7 +534,7 @@ function maxDelay(rules) {
 }
 
 // ---------------------------------------------------------------------------
-// Selection (reset-on-click)
+// Selection (reset-on-click, toggle-on-click)
 // ---------------------------------------------------------------------------
 
 async function handleWorksheetSelectionChanged(event) {
@@ -500,7 +554,8 @@ async function handleWorksheetSelectionChanged(event) {
 
   // Containment, not intersection: selecting the whole sheet, a whole row or
   // dragging across the button must not trigger it. The add-in's own select()
-  // of a target cell lies outside the button and is ignored here as well.
+  // of a target cell or SelectCell lies outside the button and is ignored here
+  // as well.
   const matchingRules = rules.filter((rule) =>
     selectedAreas.every((selected) =>
       rule.watchedAreas.some((watched) => areasInside([selected], watched))
@@ -512,46 +567,98 @@ async function handleWorksheetSelectionChanged(event) {
   }
 
   const state = getWorksheetState(event.worksheetId);
-  if (state.resetting) {
+  if (state.clicking) {
     return;
   }
 
-  state.resetting = true;
+  state.clicking = true;
   try {
-    await resetTargetCells(event.worksheetId, matchingRules);
+    await writeClickedTargets(event.worksheetId, matchingRules);
   } finally {
-    state.resetting = false;
+    state.clicking = false;
   }
 }
 
 /**
- * Writes each rule's value into its target cells and selects the first target
- * cell, moving the selection off the button so the next click fires again.
+ * Writes the target cells of the clicked rules: reset-on-click writes its
+ * value, toggle-on-click switches to its other value. Then the selection moves
+ * off the button so the next click fires again: to the first target cell for
+ * reset-on-click, to SelectCell for toggle-on-click (the first clicked rule
+ * decides).
+ *
+ * The change rules watching the toggled cells are queued as if the value had
+ * been typed. That happens before the write is sent, so the calculation event
+ * that follows the write is not missed, and the change event of the write is
+ * ignored if Excel raises it.
  */
-async function resetTargetCells(worksheetId, rules) {
+async function writeClickedTargets(worksheetId, rules) {
+  const toggleRules = rules.filter((rule) => rule.action === ACTION_TOGGLE_ON_CLICK);
   const values = new Map();
-  for (const rule of rules) {
-    rule.targetAddresses.forEach((address) => values.set(address, rule.targetValue));
-  }
-  const firstAddress = rules[0].targetAddresses[0];
+  const selectAddress =
+    rules[0].action === ACTION_TOGGLE_ON_CLICK ? rules[0].selectAddress : rules[0].targetAddresses[0];
 
   try {
     await Excel.run(async (context) => {
       const worksheet = context.workbook.worksheets.getItem(worksheetId);
 
+      const currentCells = toggleRules.map((rule) => {
+        const range = worksheet.getRange(rule.targetAddresses[0]);
+        range.load("values");
+        return range;
+      });
+      if (currentCells.length > 0) {
+        await context.sync();
+      }
+
+      for (const rule of rules) {
+        if (rule.action === ACTION_RESET_ON_CLICK) {
+          rule.targetAddresses.forEach((address) => values.set(address, rule.targetValue));
+        }
+      }
+      const toggledAreas = [];
+      toggleRules.forEach((rule, index) => {
+        const value = nextToggleValue(currentCells[index].values[0][0], rule.toggleValues);
+        rule.targetAddresses.forEach((address) => values.set(address, value));
+        toggledAreas.push(...rule.targetAreas);
+      });
+
       for (const [address, value] of values) {
         worksheet.getRange(address).values = [[value]];
       }
-      worksheet.getRange(firstAddress).select();
+      worksheet.getRange(selectAddress).select();
+
+      if (toggledAreas.length > 0) {
+        queueToggledRules(worksheetId, toggledAreas);
+      }
 
       await context.sync();
     });
-
-    setStatus(`Reset ${pluralize(values.size, "cell")} on ${rules[0].worksheetName}.`);
   } catch (error) {
     console.error(error, error.debugInfo);
-    setStatus(`Reset failed: ${describeError(error)}`);
+    setStatus(`${toggleRules.length > 0 ? "Toggle" : "Reset"} failed: ${describeError(error)}`);
+    return;
   }
+
+  if (toggleRules.length === 0) {
+    setStatus(`Reset ${pluralize(values.size, "cell")} on ${rules[0].worksheetName}.`);
+  } else if (!hasRefreshWork(getWorksheetState(worksheetId))) {
+    // With dependent rules, their progress is shown instead.
+    const address = toggleRules[0].targetAddresses[0];
+    setStatus(`Switched ${address} on ${rules[0].worksheetName} to "${values.get(address)}".`);
+  }
+}
+
+function queueToggledRules(worksheetId, toggledAreas) {
+  const state = getWorksheetState(worksheetId);
+  state.ownToggleAreas = toggledAreas;
+  state.ownToggleIgnoreUntil = performance.now() + OWN_TOGGLE_GRACE_MS;
+
+  queueChangedRules(
+    worksheetId,
+    (rulesByWorksheetId.get(worksheetId) || []).filter(
+      (rule) => !isSelectionRule(rule) && areasIntersect(rule.watchedAreas, toggledAreas)
+    )
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -575,9 +682,11 @@ function getWorksheetState(worksheetId) {
       queuedRules: new Set(),
       queuedTiming: null,
       sorting: false,
-      resetting: false,
+      clicking: false,
       ownSortArea: null,
       ownSortIgnoreUntil: 0,
+      ownToggleAreas: null,
+      ownToggleIgnoreUntil: 0,
     });
   }
 
@@ -1207,7 +1316,7 @@ async function refreshActiveWorksheet() {
     return;
   }
 
-  // reset-on-click rules only run when their button is clicked.
+  // reset-on-click and toggle-on-click rules only run when their cell is clicked.
   const rules = (rulesByWorksheetId.get(worksheetId) || []).filter(
     (rule) => !isSelectionRule(rule)
   );
