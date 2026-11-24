@@ -491,8 +491,9 @@ async function handleWorksheetChanged(event) {
     return;
   }
 
-  if (isOwnWriteChange(state, changedAreas, event)) {
-    // The toggle or popup already queued the rules watching these cells.
+  if (isOwnWriteChange(state, changedAreas, event) || isOwnDeferredWrite(event, changedAreas)) {
+    // The toggle or popup already queued the rules watching these cells, or
+    // deferred them until the worksheet is activated.
     console.debug(`Ignoring change from the add-in's own write: ${event.address}`);
     return;
   }
@@ -607,6 +608,20 @@ function isOwnWriteChange(state, changedAreas, event) {
 
   return changedAreas.every((changed) =>
     state.ownWriteAreas.some((written) => areasInside([changed], written))
+  );
+}
+
+/**
+ * The add-in writes a cell watched by refresh-on-activate only from a toggle
+ * or popup, which queues or defers the rules itself. So its change event is
+ * ignored however late it comes; otherwise a late event on the web would
+ * refresh every written worksheet at once instead of when it is activated.
+ * Needs triggerSource (ExcelApi 1.14); without it, the grace period applies.
+ */
+function isOwnDeferredWrite(event, changedAreas) {
+  return (
+    event.triggerSource === "ThisLocalAddin" &&
+    changedAreas.every((changed) => isRefreshedOnActivate(event.worksheetId, [changed]))
   );
 }
 
@@ -782,8 +797,10 @@ async function writeClickedTargets(worksheetId, rules) {
       }
       worksheet.getRange(selectAddress).select();
 
+      const writtenIds = [];
       if (toggledAreas.length > 0) {
         queueWrittenRules(worksheetId, toggledAreas);
+        writtenIds.push(worksheetId);
       }
       // The rules of the other worksheets follow their written cells as well,
       // unless a refresh-on-activate rule defers them until the worksheet is
@@ -799,6 +816,7 @@ async function writeClickedTargets(worksheetId, rules) {
         const queuedAreas = writtenAreas.filter((area) => !deferredAreas.includes(area));
 
         markOwnWrite(otherId, writtenAreas);
+        writtenIds.push(otherId);
         if (queuedAreas.length > 0) {
           queueRulesWatching(otherId, queuedAreas);
         }
@@ -809,6 +827,7 @@ async function writeClickedTargets(worksheetId, rules) {
       }
 
       await context.sync();
+      restartOwnWriteGrace(writtenIds);
     });
   } catch (error) {
     console.error(error, error.debugInfo);
@@ -857,6 +876,20 @@ function markOwnWrite(worksheetId, writtenAreas) {
   const state = getWorksheetState(worksheetId);
   state.ownWriteAreas = writtenAreas;
   state.ownWriteIgnoreUntil = performance.now() + OWN_WRITE_GRACE_MS;
+}
+
+/**
+ * Starts the grace period of the marked write again once it has been synced:
+ * on the web, the sync (with its recalculation) can take longer than the
+ * grace period, and the change events only follow it.
+ */
+function restartOwnWriteGrace(worksheetIds) {
+  for (const id of worksheetIds) {
+    const state = getWorksheetState(id);
+    if (state.ownWriteAreas) {
+      state.ownWriteIgnoreUntil = performance.now() + OWN_WRITE_GRACE_MS;
+    }
+  }
 }
 
 /** Queues the change rules watching the areas, as if a value had been typed there. */
@@ -1104,6 +1137,9 @@ async function writeMultiSelectResult(worksheetId, rule, value) {
       }
 
       await context.sync();
+      if (written) {
+        restartOwnWriteGrace([worksheetId]);
+      }
     });
   } catch (error) {
     console.error(error, error.debugInfo);
