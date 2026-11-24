@@ -1021,6 +1021,7 @@ function getWorksheetState(worksheetId) {
       immediateTimer: null,
       statusTimer: null,
       statusWatchUntil: 0,
+      statusFull: false,
       statusUpdating: false,
       statusRequested: false,
       running: false,
@@ -1701,7 +1702,7 @@ function scheduleFilterStatusUpdate(worksheetId) {
   }
 
   getWorksheetState(worksheetId).statusWatchUntil = performance.now() + STATUS_WATCH_MS;
-  queueFilterStatusUpdate(worksheetId);
+  queueFilterStatusUpdate(worksheetId, true);
 }
 
 /**
@@ -1713,23 +1714,29 @@ function scheduleFilterStatusUpdate(worksheetId) {
  * every change, so following all of them would read the filters of every
  * listed worksheet after every change. Worksheets without a filter event
  * follow every calculation, as nothing else tells that their filters changed.
+ * Other calculations only compare the visible row count (D) with the written
+ * one (C) and read the filters when they differ: Excel for the web does not
+ * always raise the filter event, or calculates D after the watch ended.
  */
 function followFilterStatus(worksheetId) {
   if (!statusRowsByWorksheetId.has(worksheetId)) {
     return;
   }
   const state = worksheetStates.get(worksheetId);
-  if (
+  queueFilterStatusUpdate(
+    worksheetId,
     statusFollowsEveryCalculation.has(worksheetId) ||
-    (state && performance.now() < state.statusWatchUntil)
-  ) {
-    queueFilterStatusUpdate(worksheetId);
-  }
+      (!!state && performance.now() < state.statusWatchUntil)
+  );
 }
 
-/** Debounces status updates: several events follow one filter change. */
-function queueFilterStatusUpdate(worksheetId) {
+/**
+ * Debounces status updates: several events follow one filter change. A full
+ * update reads the filters; otherwise only when C and D differ.
+ */
+function queueFilterStatusUpdate(worksheetId, full) {
   const state = getWorksheetState(worksheetId);
+  state.statusFull = state.statusFull || full;
   window.clearTimeout(state.statusTimer);
   state.statusTimer = window.setTimeout(() => runFilterStatusUpdate(worksheetId), DEFAULT_DELAY_MS);
 }
@@ -1742,20 +1749,23 @@ async function runFilterStatusUpdate(worksheetId) {
     return;
   }
   if (state.statusUpdating) {
+    // statusFull stays set for the requested update.
     state.statusRequested = true;
     return;
   }
 
+  const full = state.statusFull;
+  state.statusFull = false;
   state.statusUpdating = true;
   try {
-    await updateFilterStatus(worksheetId);
+    await updateFilterStatus(worksheetId, full);
   } finally {
     state.statusUpdating = false;
   }
 
   if (state.statusRequested) {
     state.statusRequested = false;
-    queueFilterStatusUpdate(worksheetId);
+    queueFilterStatusUpdate(worksheetId, false);
   }
 }
 
@@ -1763,9 +1773,10 @@ async function runFilterStatusUpdate(worksheetId) {
  * Writes the filter text (B) and the visible row count it belongs to (C) into
  * the worksheet's status row. C is the value of D read after the filters, so
  * the workbook's formula only shows B while the filters are still the same.
- * If the filters cannot be read, nothing is written.
+ * If the filters cannot be read, nothing is written. Unless full, the filters
+ * are only read when C differs from D.
  */
-async function updateFilterStatus(worksheetId) {
+async function updateFilterStatus(worksheetId, full) {
   const row = statusRowsByWorksheetId.get(worksheetId);
   if (!row) {
     return;
@@ -1775,6 +1786,16 @@ async function updateFilterStatus(worksheetId) {
   let outcome = "unchanged";
   try {
     await Excel.run(async (context) => {
+      if (!full) {
+        const countRow = context.workbook.worksheets.getItem(STATUS_SHEET_NAME).getRange(`C${row}:D${row}`);
+        countRow.load("values");
+        await context.sync();
+        const [writtenCount, visibleCount] = countRow.values[0];
+        if (writtenCount === visibleCount) {
+          return;
+        }
+      }
+
       const worksheet = context.workbook.worksheets.getItem(worksheetId);
       const autoFilter = worksheet.autoFilter;
       const filterRange = autoFilter.getRangeOrNullObject();
