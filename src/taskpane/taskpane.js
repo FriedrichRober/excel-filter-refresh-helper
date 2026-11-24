@@ -78,9 +78,8 @@ const POPUP_SIZE = { width: 30, height: 65 };
 // in its own sync and report the time of every step. Slower overall; set to
 // false for normal use.
 const DIAGNOSTICS = false;
-// Temporary: false turns the filter info off (no _FilterStatus listeners or
-// writes), to measure what it costs. Set back to true for normal use.
-const FILTER_INFO = false;
+// How long after a filter change calculations still update the filter status.
+const STATUS_WATCH_MS = 3000;
 
 /** @type {Map<string, object[]>} rules grouped by worksheet ID */
 let rulesByWorksheetId = new Map();
@@ -92,6 +91,8 @@ let statusRowsByWorksheetId = new Map();
 const changeRegisteredWorksheetIds = new Set();
 const calculatedRegisteredWorksheetIds = new Set();
 const filteredRegisteredWorksheetIds = new Set();
+// Listed worksheets without a filter event (see followFilterStatus).
+const statusFollowsEveryCalculation = new Set();
 const selectionRegisteredWorksheetIds = new Set();
 let worksheetAddedHandlerRegistered = false;
 let reloadTimer = null;
@@ -202,7 +203,7 @@ async function loadConfiguration() {
       : [];
     rulesByWorksheetId = groupRulesByWorksheet(activeRules);
     // On desktop, a macro writes the filter status.
-    statusRowsByWorksheetId = platform === PLATFORM_WEB && FILTER_INFO ? result.statusRows : new Map();
+    statusRowsByWorksheetId = platform === PLATFORM_WEB ? result.statusRows : new Map();
 
     const changeIds = worksheetIdsWithRules(activeRules, (rule) => !isSelectionRule(rule));
     await registerEventHandlers(
@@ -355,7 +356,13 @@ async function registerEventHandlers(
     }
 
     for (const id of newFilteredIds) {
-      filterEventOf(worksheets.getItem(id))?.add(handleWorksheetFiltered);
+      const filterEvent = filterEventOf(worksheets.getItem(id));
+      if (filterEvent) {
+        filterEvent.add(handleWorksheetFiltered);
+      } else {
+        // Only calculations can tell that its filters changed.
+        statusFollowsEveryCalculation.add(id);
+      }
     }
 
     for (const id of newSelectionIds) {
@@ -533,7 +540,7 @@ function isOwnWriteChange(state, changedAreas, event) {
 }
 
 async function handleWorksheetCalculated(event) {
-  scheduleFilterStatusUpdate(event.worksheetId);
+  followFilterStatus(event.worksheetId);
 
   const state = worksheetStates.get(event.worksheetId);
 
@@ -1012,6 +1019,7 @@ function getWorksheetState(worksheetId) {
       immediateChangedAt: 0,
       immediateTimer: null,
       statusTimer: null,
+      statusWatchUntil: 0,
       statusUpdating: false,
       statusRequested: false,
       running: false,
@@ -1625,15 +1633,44 @@ async function handleWorksheetFiltered(event) {
 }
 
 /**
- * Debounces status updates. Several calculation and filter events follow one
- * filter change, and writing the status causes another calculation; that one
- * finds the status unchanged and writes nothing, so it does not loop.
+ * Updates the status after a filter change, the add-in's own refresh or a
+ * configuration load, and follows the worksheet's calculations for a short
+ * while after it (see followFilterStatus).
  */
 function scheduleFilterStatusUpdate(worksheetId) {
   if (!statusRowsByWorksheetId.has(worksheetId)) {
     return;
   }
 
+  getWorksheetState(worksheetId).statusWatchUntil = performance.now() + STATUS_WATCH_MS;
+  queueFilterStatusUpdate(worksheetId);
+}
+
+/**
+ * A calculation updates the status only shortly after a filter change: the
+ * visible row count may be calculated after the filter event, and writing
+ * the status calculates again (that update finds it unchanged and writes
+ * nothing, so it does not loop). Calculations at other times cannot change
+ * which rows a filter hides. Volatile formulas calculate every worksheet on
+ * every change, so following all of them would read the filters of every
+ * listed worksheet after every change. Worksheets without a filter event
+ * follow every calculation, as nothing else tells that their filters changed.
+ */
+function followFilterStatus(worksheetId) {
+  if (!statusRowsByWorksheetId.has(worksheetId)) {
+    return;
+  }
+  const state = worksheetStates.get(worksheetId);
+  if (
+    statusFollowsEveryCalculation.has(worksheetId) ||
+    (state && performance.now() < state.statusWatchUntil)
+  ) {
+    queueFilterStatusUpdate(worksheetId);
+  }
+}
+
+/** Debounces status updates: several events follow one filter change. */
+function queueFilterStatusUpdate(worksheetId) {
   const state = getWorksheetState(worksheetId);
   window.clearTimeout(state.statusTimer);
   state.statusTimer = window.setTimeout(() => runFilterStatusUpdate(worksheetId), DEFAULT_DELAY_MS);
@@ -1660,7 +1697,7 @@ async function runFilterStatusUpdate(worksheetId) {
 
   if (state.statusRequested) {
     state.statusRequested = false;
-    scheduleFilterStatusUpdate(worksheetId);
+    queueFilterStatusUpdate(worksheetId);
   }
 }
 
@@ -1691,8 +1728,9 @@ async function updateFilterStatus(worksheetId) {
       statusRow.load("values");
       await context.sync();
 
+      // The header row is only needed to name active filters.
       let text = "";
-      if (!filterRange.isNullObject) {
+      if (!filterRange.isNullObject && (autoFilter.criteria || []).some(isActiveCriterion)) {
         const headerRow = filterRange.getRow(0);
         headerRow.load("values,text");
         await context.sync();
