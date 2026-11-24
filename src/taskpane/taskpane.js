@@ -74,9 +74,10 @@ const OWN_SORT_GRACE_MS = 1000;
 const OWN_WRITE_GRACE_MS = 2000;
 // Size of the multi-select popup, in percent of the Excel window.
 const POPUP_SIZE = { width: 30, height: 65 };
-// Temporary diagnostics: run each step of a sort in its own sync and report
-// the time of every step. Slower overall; set to false for normal use.
-const SORT_DIAGNOSTICS = false;
+// Temporary diagnostics: run each step of a refresh (sort, filters, columns)
+// in its own sync and report the time of every step. Slower overall; set to
+// false for normal use.
+const DIAGNOSTICS = true;
 
 /** @type {Map<string, object[]>} rules grouped by worksheet ID */
 let rulesByWorksheetId = new Map();
@@ -1172,7 +1173,7 @@ async function applyRules(worksheetId, rules, timing) {
 
   const state = getWorksheetState(worksheetId);
   const sortTiming = { sortMs: 0, filterMs: 0 };
-  const diagnostics = SORT_DIAGNOSTICS && sortRule ? { steps: [] } : null;
+  const diagnostics = DIAGNOSTICS ? { steps: [] } : null;
   let criteriaLost = false;
 
   try {
@@ -1190,9 +1191,7 @@ async function applyRules(worksheetId, rules, timing) {
       );
       const queueLoads = (withCriteria) => {
         filterRange.load(
-          sortRule
-            ? `isNullObject,columnCount,address${diagnostics ? ",rowCount" : ""}`
-            : "isNullObject,columnCount"
+          `isNullObject,columnCount${sortRule ? ",address" : ""}${diagnostics ? ",rowCount" : ""}`
         );
         if (withCriteria) {
           autoFilter.load("criteria");
@@ -1231,7 +1230,9 @@ async function applyRules(worksheetId, rules, timing) {
       if (diagnostics) {
         diagnostics.steps.push(`load ${formatMs(performance.now() - loadStartedAt)}`);
         diagnostics.context = [
-          `${filterRange.rowCount} rows x ${filterRange.columnCount} columns`,
+          filterRange.isNullObject
+            ? "no AutoFilter"
+            : `${filterRange.rowCount} rows x ${filterRange.columnCount} columns`,
           `calculation ${context.workbook.application.calculationMode}`,
           `protected ${worksheet.protection.protected}`,
         ];
@@ -1248,6 +1249,11 @@ async function applyRules(worksheetId, rules, timing) {
         needsUnprotect && worksheet.protection.protected ? worksheet.protection.options : null;
       if (protectionOptions) {
         worksheet.protection.unprotect();
+        if (diagnostics) {
+          const unprotectStartedAt = performance.now();
+          await context.sync();
+          diagnostics.steps.push(`unprotect ${formatMs(performance.now() - unprotectStartedAt)}`);
+        }
       }
 
       try {
@@ -1280,7 +1286,12 @@ async function applyRules(worksheetId, rules, timing) {
           }
         }
 
+        const finalStartedAt = performance.now();
         await context.sync();
+        if (diagnostics) {
+          const label = sortRule ? "final sync" : valuesByColumn.size > 0 ? "filters and columns" : "columns";
+          diagnostics.steps.push(`${label} ${formatMs(performance.now() - finalStartedAt)}`);
+        }
       } finally {
         if (protectionOptions) {
           try {
@@ -1326,7 +1337,7 @@ async function applyRules(worksheetId, rules, timing) {
       text += " Excel could not read the active filters, so only the configured filters were applied again.";
     }
     if (diagnostics) {
-      text += ` Diagnostics:${diagnostics.steps.join(", ")}. [${diagnostics.context.join(", ")}]`;
+      text += ` Diagnostics: ${diagnostics.steps.join(", ")}. [${diagnostics.context.join(", ")}]`;
     }
 
     console.debug(text);
@@ -1662,6 +1673,8 @@ async function updateFilterStatus(worksheetId) {
     return;
   }
 
+  const startedAt = performance.now();
+  let outcome = "unchanged";
   try {
     await Excel.run(async (context) => {
       const worksheet = context.workbook.worksheets.getItem(worksheetId);
@@ -1695,6 +1708,7 @@ async function updateFilterStatus(worksheetId) {
       }
       // A refresh may have started meanwhile; it schedules a new update.
       if (hasRefreshWork(getWorksheetState(worksheetId))) {
+        outcome = "skipped";
         return;
       }
 
@@ -1702,11 +1716,16 @@ async function updateFilterStatus(worksheetId) {
         .getItem(STATUS_SHEET_NAME)
         .getRange(`B${row}:C${row}`).values = [[text, visibleCount]];
       await context.sync();
+      outcome = "written";
     });
   } catch (error) {
     // E.g. Excel failing on AutoFilter.criteria with an internal error. The
     // workbook then shows only the row count, so this is not reported.
+    outcome = "failed";
     console.debug("Filter status was not updated.", error, error.debugInfo);
+  }
+  if (DIAGNOSTICS) {
+    console.log(`Diagnostics: filter info update ${outcome} in ${formatMs(performance.now() - startedAt)}.`);
   }
 }
 

@@ -88,9 +88,10 @@ export function formatFilterStatus(headers, criteria, excluded = new Set()) {
 
 /**
  * Whether a criterion from AutoFilter.criteria really filters its column.
- * Excel can return criteria with filterOn set for columns without a filter,
- * e.g. Custom without criterion1 or Values without values, so filterOn alone
- * says nothing; the setting the filter type needs must be present too.
+ * Excel for the web returns { filterOn: "BottomItems", dynamicCriteria:
+ * "Unknown", operator: "And" } for columns without a filter, and apply()
+ * rejects it, so filterOn alone says nothing; the setting the filter type
+ * needs must be present too.
  */
 export function isActiveCriterion(criterion) {
   if (!criterion || !criterion.filterOn) {
