@@ -122,11 +122,36 @@ export function isActiveCriterion(criterion) {
 }
 
 export function formatHeader(value) {
-  return String(value ?? "")
-    .replace(/\r/g, "")
-    .replace(/-\n/g, "-")
-    .replace(/\n/g, " ")
-    .replace(/^ +| +$/g, "");
+  return oneLine(value);
+}
+
+/**
+ * A header or a value on one line, the status has a line per kind of filter:
+ * each line without the spaces at its ends, empty ones left out. A break after
+ * a hyphen and before a small letter goes with the hyphen (Schlüssel-/komponenten),
+ * after another hyphen only the break (Monta-/Lager); any other break becomes
+ * a space. Same as OneLine of the macro.
+ */
+export function oneLine(value) {
+  let result = "";
+  for (const raw of String(value ?? "").replace(/\r/g, "").split("\n")) {
+    const line = raw.replace(/^ +| +$/g, "");
+    if (line === "") {
+      continue;
+    }
+    if (result === "") {
+      result = line;
+    } else if (result.endsWith("-")) {
+      const first = line.charAt(0);
+      if (first !== first.toUpperCase()) {
+        result = result.slice(0, -1);
+      }
+      result += line;
+    } else {
+      result += " " + line;
+    }
+  }
+  return result;
 }
 
 function formatSetting(criterion) {
@@ -196,5 +221,5 @@ function isPlainValue(criterion) {
 }
 
 function quote(text) {
-  return QUOTE_OPEN + text + QUOTE_CLOSE;
+  return QUOTE_OPEN + oneLine(text) + QUOTE_CLOSE;
 }
