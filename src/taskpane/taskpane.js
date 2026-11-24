@@ -7,7 +7,8 @@
  *   filter-value  re-applies a value filter on one column of the AutoFilter,
  *                 leaving other columns untouched (after recalculation)
  *   sort          sorts the AutoFilter range by one column and keeps all
- *                 filters (after recalculation)
+ *                 filters (after recalculation); skipped when the column of
+ *                 numbers is already in order
  *   show-columns  shows the columns the watched cell's value selects and hides
  *                 the other columns of the rule (right away)
  *
@@ -1256,8 +1257,27 @@ async function applyRules(worksheetId, rules, timing) {
         ]);
       }
 
+      // Sorting clears and re-applies every filter, which costs seconds in
+      // Excel for the web. When the sort column is already in order, nothing
+      // would move, so only the filters are applied.
+      if (sortRule) {
+        const checkStartedAt = performance.now();
+        const keyColumn = filterRange.getColumn(sortRule.sortColumnIndex);
+        keyColumn.load("values");
+        await context.sync();
+        // Row 0 is the header.
+        sortTiming.skipped = isAlreadySorted(
+          keyColumn.values.slice(1).map((row) => row[0]),
+          sortRule.ascending
+        );
+        sortTiming.checkMs = performance.now() - checkStartedAt;
+      }
+      const sorting = sortRule !== null && !sortTiming.skipped;
+
       const protectionOptions =
-        needsUnprotect && worksheet.protection.protected ? worksheet.protection.options : null;
+        (sorting || columnRules.length > 0) && worksheet.protection.protected
+          ? worksheet.protection.options
+          : null;
       if (protectionOptions) {
         worksheet.protection.unprotect();
         if (diagnostics) {
@@ -1270,7 +1290,7 @@ async function applyRules(worksheetId, rules, timing) {
       try {
         columnRules.forEach((rule, index) => showColumns(worksheet, rule, choiceCells[index].values[0][0]));
 
-        if (sortRule) {
+        if (sorting) {
           state.ownSortArea = parseAddressList(filterRange.address)[0];
           state.sorting = true;
           try {
@@ -1300,7 +1320,7 @@ async function applyRules(worksheetId, rules, timing) {
         const finalStartedAt = performance.now();
         await context.sync();
         if (diagnostics) {
-          const label = sortRule ? "final sync" : valuesByColumn.size > 0 ? "filters and columns" : "columns";
+          const label = sorting ? "final sync" : valuesByColumn.size > 0 ? "filters and columns" : "columns";
           diagnostics.steps.push(`${label} ${formatMs(performance.now() - finalStartedAt)}`);
         }
       } finally {
@@ -1330,12 +1350,22 @@ async function applyRules(worksheetId, rules, timing) {
       parts.push(`table filters ${ms(tableMs)}`);
     }
     parts.push(`Excel step ${ms(finishedAt - stepStartedAt)}`);
-    if (sortRule && sortTiming.batchError) {
+    if (sortRule) {
+      parts.push(`order check ${ms(sortTiming.checkMs)}`);
+    }
+    if (sortTiming.skipped) {
+      parts.push("sort skipped, already in order");
+    } else if (sortRule && sortTiming.batchError) {
       parts.push(`sort ${ms(sortTiming.sortMs)}`, `filters retried ${ms(sortTiming.filterMs)}`);
     } else if (sortRule && !diagnostics) {
       parts.push(`sort and filters ${ms(sortTiming.sortMs)}`);
     }
-    let text = `${doneText} in ${ms(finishedAt - timing.changedAt)} (${parts.join(", ")}).`;
+    const shownDoneText = sortTiming.skipped
+      ? valuesByColumn.size > 0
+        ? "Filter refreshed"
+        : "Already in order"
+      : doneText;
+    let text = `${shownDoneText} in ${ms(finishedAt - timing.changedAt)} (${parts.join(", ")}).`;
     if (sortTiming.batchError) {
       text += ` Re-applying the filters in one batch failed: ${sortTiming.batchError}.`;
     }
@@ -1411,6 +1441,34 @@ function showColumns(worksheet, rule, value) {
     previous = column;
   }
   flush();
+}
+
+/**
+ * Whether the values of the sort column (top to bottom, hidden rows too) are
+ * already in the order the sort would give, so it would move nothing. Only
+ * numbers are compared, with blanks after them, where Excel puts blanks in
+ * either direction. Text, logical values and errors count as not in order:
+ * Excel compares them by its own rules, so the sort runs to be safe.
+ */
+function isAlreadySorted(values, ascending) {
+  let previous = null;
+  let blankSeen = false;
+
+  for (const value of values) {
+    if (value === "" || value === null || value === undefined) {
+      blankSeen = true;
+      continue;
+    }
+    if (blankSeen || typeof value !== "number") {
+      return false;
+    }
+    if (previous !== null && (ascending ? value < previous : value > previous)) {
+      return false;
+    }
+    previous = value;
+  }
+
+  return true;
 }
 
 /**
