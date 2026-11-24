@@ -77,7 +77,7 @@ const POPUP_SIZE = { width: 30, height: 65 };
 // Temporary diagnostics: run each step of a refresh (sort, filters, columns)
 // in its own sync and report the time of every step. Slower overall; set to
 // false for normal use.
-const DIAGNOSTICS = true;
+const DIAGNOSTICS = false;
 
 /** @type {Map<string, object[]>} rules grouped by worksheet ID */
 let rulesByWorksheetId = new Map();
@@ -1322,7 +1322,10 @@ async function applyRules(worksheetId, rules, timing) {
     if (sortRule && sortTiming.batchError) {
       parts.push(`sort ${ms(sortTiming.sortMs)}`, `filters retried ${ms(sortTiming.filterMs)}`);
     } else if (sortRule && !diagnostics) {
-      parts.push(`sort and filters ${ms(sortTiming.sortMs)}`);
+      parts.push(
+        `sort and filters ${ms(sortTiming.sortMs)}` +
+          (sortTiming.screenSuspended ? " with screen updating suspended" : "")
+      );
     }
     let text = `${doneText} in ${ms(finishedAt - timing.changedAt)} (${parts.join(", ")}).`;
     if (sortTiming.batchError) {
@@ -1500,13 +1503,31 @@ async function sortKeepingFilters(context, autoFilter, filterRange, sortRule, fi
     );
   };
   const startedAt = performance.now();
-
-  queueClearAndSort();
-  let batchError = null;
-  try {
+  const runBatch = async (suspendScreen) => {
+    if (suspendScreen) {
+      context.workbook.application.suspendScreenUpdatingUntilNextSync();
+    }
+    queueClearAndSort();
     applyFilters(autoFilter, filterRange, filters);
     await context.sync();
+  };
+
+  let batchError = null;
+  try {
+    try {
+      await runBatch(screenUpdatingSuspendable());
+    } catch (error) {
+      // The suspension is the first operation, so nothing ran yet; Excel
+      // versions without it get the batch again without it.
+      if (!/suspendScreenUpdating/i.test(String(error.debugInfo?.errorLocation ?? ""))) {
+        throw error;
+      }
+      console.error("Excel cannot suspend screen updating; sorting without it.", error.debugInfo);
+      screenUpdatingSupported = false;
+      await runBatch(false);
+    }
     timing.sortMs = performance.now() - startedAt;
+    timing.screenSuspended = screenUpdatingSuspendable();
   } catch (error) {
     console.error("Sorting and re-applying the filters in one batch failed; retrying in steps.", error, error.debugInfo);
     batchError = error;
@@ -1601,6 +1622,21 @@ async function sortWithDiagnostics(context, autoFilter, filterRange, sortRule, f
   }
 
   await step("empty sync after", () => {});
+}
+
+/**
+ * Whether a batch can suspend screen updating, like ScreenUpdating = False in
+ * VBA: Excel then redraws once after the batch instead of after each step.
+ * ExcelApi 1.9 has it, but an Excel version may still reject it; the first
+ * rejection switches it off for the session.
+ */
+let screenUpdatingSupported = null;
+
+function screenUpdatingSuspendable() {
+  if (screenUpdatingSupported === null) {
+    screenUpdatingSupported = Office.context.requirements.isSetSupported("ExcelApi", "1.9");
+  }
+  return screenUpdatingSupported;
 }
 
 function formatMs(value) {
