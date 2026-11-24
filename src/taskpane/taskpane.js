@@ -56,7 +56,13 @@ import {
   parseConfiguration,
   splitListSource,
 } from "./config";
-import { STATUS_SHEET_NAME, formatFilterStatus, parseExcludedColumns, parseStatusRows } from "./filterStatus";
+import {
+  STATUS_SHEET_NAME,
+  formatFilterStatus,
+  isActiveCriterion,
+  parseExcludedColumns,
+  parseStatusRows,
+} from "./filterStatus";
 
 // Run pending rules anyway if no calculation event follows a watched change.
 const CALCULATION_FALLBACK_MS = 2000;
@@ -1449,7 +1455,7 @@ function valuesCriteria(values) {
  * keep only the ones that are set. Returns null for a column without a filter.
  */
 function cleanCriteria(criterion) {
-  if (!criterion || !criterion.filterOn) {
+  if (!isActiveCriterion(criterion)) {
     return null;
   }
 

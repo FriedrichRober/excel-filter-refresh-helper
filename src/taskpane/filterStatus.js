@@ -76,7 +76,7 @@ export function formatFilterStatus(headers, criteria, excluded = new Set()) {
   const parts = [];
 
   (criteria || []).forEach((criterion, columnIndex) => {
-    if (excluded.has(columnIndex) || !criterion || !criterion.filterOn) {
+    if (excluded.has(columnIndex) || !isActiveCriterion(criterion)) {
       return;
     }
     parts.push(`${formatHeader(headers[columnIndex])} ${formatSetting(criterion)}`);
@@ -84,6 +84,40 @@ export function formatFilterStatus(headers, criteria, excluded = new Set()) {
 
   const text = parts.join(SEPARATOR);
   return text.length > MAX_STATUS_LENGTH ? text.slice(0, MAX_STATUS_LENGTH - 1) + ELLIPSIS : text;
+}
+
+/**
+ * Whether a criterion from AutoFilter.criteria really filters its column.
+ * Excel can return criteria with filterOn set for columns without a filter,
+ * e.g. Custom without criterion1 or Values without values, so filterOn alone
+ * says nothing; the setting the filter type needs must be present too.
+ */
+export function isActiveCriterion(criterion) {
+  if (!criterion || !criterion.filterOn) {
+    return false;
+  }
+
+  const set = (value) => value !== undefined && value !== null && value !== "";
+
+  switch (criterion.filterOn) {
+    case "Values":
+      return Array.isArray(criterion.values) && criterion.values.length > 0;
+    case "Custom":
+    case "TopItems":
+    case "TopPercent":
+    case "BottomItems":
+    case "BottomPercent":
+      return set(criterion.criterion1) || set(criterion.criterion2);
+    case "Dynamic":
+      return set(criterion.dynamicCriteria) && criterion.dynamicCriteria !== "Unknown";
+    case "CellColor":
+    case "FontColor":
+      return set(criterion.color);
+    case "Icon":
+      return !!criterion.icon && set(criterion.icon.set);
+    default:
+      return false;
+  }
 }
 
 export function formatHeader(value) {
