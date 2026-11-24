@@ -1133,9 +1133,11 @@ async function applyRules(worksheetId, rules, timing) {
 
   // Table filters first: they need no AutoFilter on this worksheet.
   const tableRules = rules.filter((rule) => rule.action === ACTION_FILTER_TABLE);
+  const tableStartedAt = performance.now();
   if (tableRules.length > 0) {
     await applyTableFilters(worksheetId, tableRules);
   }
+  const tableMs = performance.now() - tableStartedAt;
 
   for (const rule of rules) {
     if (rule.action === ACTION_FILTER_VALUE) {
@@ -1291,17 +1293,29 @@ async function applyRules(worksheetId, rules, timing) {
 
     const finishedAt = performance.now();
     const ms = formatMs;
+    // "queue" is the wait behind an earlier refresh of the same worksheet.
     const parts = [
       `calculation wait ${ms(timing.readyAt - timing.changedAt)}`,
-      `queue ${ms(stepStartedAt - timing.readyAt)}`,
-      `Excel step ${ms(finishedAt - stepStartedAt)}`,
+      `queue ${ms(tableStartedAt - timing.readyAt)}`,
     ];
-    if (sortRule && sortTiming.filterMs > 0) {
-      parts.push(`sort ${ms(sortTiming.sortMs)}`, `filters one by one ${ms(sortTiming.filterMs)}`);
+    if (tableRules.length > 0) {
+      parts.push(`table filters ${ms(tableMs)}`);
+    }
+    parts.push(`Excel step ${ms(finishedAt - stepStartedAt)}`);
+    if (sortRule && sortTiming.batchError) {
+      parts.push(`sort ${ms(sortTiming.sortMs)}`, `filters retried ${ms(sortTiming.filterMs)}`);
     } else if (sortRule && !diagnostics) {
       parts.push(`sort and filters ${ms(sortTiming.sortMs)}`);
     }
     let text = `${doneText} in ${ms(finishedAt - timing.changedAt)} (${parts.join(", ")}).`;
+    if (sortTiming.batchError) {
+      text += ` Re-applying the filters in one batch failed: ${sortTiming.batchError}.`;
+    }
+    if (sortTiming.failedColumns?.length > 0) {
+      text +=
+        ` The filter on column index ${sortTiming.failedColumns.join(", ")} could not be applied again` +
+        " and was left off.";
+    }
     if (criteriaLost) {
       text += " Excel could not read the active filters, so only the configured filters were applied again.";
     }
@@ -1451,8 +1465,9 @@ function cleanCriteria(criterion) {
 /**
  * Excel sorts only the rows a filter shows, so all filters are cleared, the
  * range is sorted and the saved filters are applied again. All of it runs
- * in one batch; if re-applying fails, each filter is tried on its own, so a
- * failing filter shows more rows instead of stopping the refresh.
+ * in one batch; if re-applying fails, the filters are retried in shrinking
+ * groups (see applyFiltersBisecting), so a failing filter shows more rows
+ * instead of stopping the refresh.
  *
  * Suspending calculation during the batch (suspendApiCalculationUntilNextSync
  * plus a recalculation afterwards) was measured slower in Excel for the web,
@@ -1470,35 +1485,65 @@ async function sortKeepingFilters(context, autoFilter, filterRange, sortRule, fi
   const startedAt = performance.now();
 
   queueClearAndSort();
-  let inOneBatch = true;
+  let batchError = null;
   try {
     applyFilters(autoFilter, filterRange, filters);
     await context.sync();
     timing.sortMs = performance.now() - startedAt;
   } catch (error) {
     console.error("Sorting and re-applying the filters in one batch failed; retrying in steps.", error, error.debugInfo);
-    inOneBatch = false;
+    batchError = error;
   }
 
-  if (!inOneBatch) {
-    // Operations after the failing one were not run; repeat them step by step.
-    queueClearAndSort();
-    await context.sync();
+  if (batchError) {
+    timing.batchError = describeError(batchError);
+
+    // A batch is not transactional: the operations before the failing one
+    // stay applied. When a filter failed, the range is already sorted, so
+    // only the filters are repeated; otherwise the sort is repeated too.
+    const location = String(batchError.debugInfo?.errorLocation ?? "");
+    if (!/AutoFilter\.apply/i.test(location)) {
+      queueClearAndSort();
+      await context.sync();
+    }
 
     const filtersStartedAt = performance.now();
     timing.sortMs = filtersStartedAt - startedAt;
-
-    for (const [columnIndex, criterion] of filters) {
-      try {
-        applyFilters(autoFilter, filterRange, new Map([[columnIndex, criterion]]));
-        await context.sync();
-      } catch (columnError) {
-        console.error(`Filter on column index ${columnIndex} could not be applied again.`, columnError);
-      }
-    }
-
+    timing.failedColumns = await applyFiltersBisecting(context, autoFilter, filterRange, [...filters]);
     timing.filterMs = performance.now() - filtersStartedAt;
   }
+}
+
+/**
+ * Applies the filters in as few syncs as possible: a group that fails is
+ * split in halves until the failing filters are found. Every sync costs a
+ * round trip and a recalculation, so one sync per filter is very slow with
+ * many filters. Applying a filter twice is harmless.
+ *
+ * @param {Array<[number, object]>} entries filter criteria by column index
+ * @returns {Promise<number[]>} column indexes whose filter could not be applied
+ */
+async function applyFiltersBisecting(context, autoFilter, filterRange, entries) {
+  if (entries.length === 0) {
+    return [];
+  }
+
+  try {
+    applyFilters(autoFilter, filterRange, new Map(entries));
+    await context.sync();
+    return [];
+  } catch (error) {
+    if (entries.length === 1) {
+      console.error(`Filter on column index ${entries[0][0]} could not be applied again.`, entries[0][1], error, error.debugInfo);
+      return [entries[0][0]];
+    }
+  }
+
+  const middle = Math.ceil(entries.length / 2);
+  return [
+    ...(await applyFiltersBisecting(context, autoFilter, filterRange, entries.slice(0, middle))),
+    ...(await applyFiltersBisecting(context, autoFilter, filterRange, entries.slice(middle))),
+  ];
 }
 
 /**
