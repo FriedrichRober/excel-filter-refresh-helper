@@ -22,6 +22,17 @@
  * decides), selects the rule's SelectCell and then runs the other rules that
  * watch the written cells, as if the user had typed the value. It does not
  * wait for the change event of its own write and ignores it if it comes.
+ * Target cells on other worksheets are written too; their rules run at once,
+ * unless a refresh-on-activate rule watches the cell there.
+ *
+ * refresh-on-activate rules defer that refresh until the worksheet is opened:
+ * when it is activated (or active when the configuration loads) and its
+ * watched cell differs from the value recorded in the rule's target cell, the
+ * rules watching that cell run as if the value had been typed, and the value
+ * is recorded afterwards. Whenever those rules run for that cell otherwise
+ * (a click, a typed value, the Run button), the value is recorded as well.
+ * One worksheet catches up at a time; a sheet switch during a catch-up is
+ * handled when it is done.
  *
  * multi-select-on-click rules are triggered by selection too: the add-in reads
  * the entries of the watched cell's data-validation list and opens a popup
@@ -43,6 +54,7 @@ import {
   ACTION_FILTER_VALUE,
   ACTION_FILTER_TABLE,
   ACTION_MULTI_SELECT_ON_CLICK,
+  ACTION_REFRESH_ON_ACTIVATE,
   ACTION_RESET_ON_CLICK,
   ACTION_SHOW_COLUMNS,
   ACTION_SORT,
@@ -81,6 +93,9 @@ const POPUP_SIZE = { width: 30, height: 65 };
 const DIAGNOSTICS = false;
 // How long after a filter change calculations still update the filter status.
 const STATUS_WATCH_MS = 3000;
+// A catch-up waits at most this long for its worksheet's refresh before it
+// handles the next activated worksheet.
+const CATCH_UP_TIMEOUT_MS = 60000;
 
 /** @type {Map<string, object[]>} rules grouped by worksheet ID */
 let rulesByWorksheetId = new Map();
@@ -96,7 +111,11 @@ const filteredRegisteredWorksheetIds = new Set();
 const statusFollowsEveryCalculation = new Set();
 const selectionRegisteredWorksheetIds = new Set();
 let worksheetAddedHandlerRegistered = false;
+let activatedHandlerRegistered = false;
 let reloadTimer = null;
+// One catch-up (refresh-on-activate) at a time; see requestCatchUp.
+let catchUpRunning = false;
+let catchUpRequested = false;
 // Office shows one dialog at a time; clicks while it is open are ignored.
 let popupOpen = false;
 
@@ -206,12 +225,14 @@ async function loadConfiguration() {
     // On desktop, a macro writes the filter status.
     statusRowsByWorksheetId = platform === PLATFORM_WEB ? result.statusRows : new Map();
 
-    const changeIds = worksheetIdsWithRules(activeRules, (rule) => !isSelectionRule(rule));
+    const changeIds = worksheetIdsWithRules(activeRules, isChangeRule);
+    const watchesActivation = activeRules.some(isActivationRule);
     await registerEventHandlers(
       changeIds,
       [...new Set([...changeIds, ...statusRowsByWorksheetId.keys()])],
       [...statusRowsByWorksheetId.keys()],
-      worksheetIdsWithRules(activeRules, isSelectionRule)
+      worksheetIdsWithRules(activeRules, isSelectionRule),
+      watchesActivation
     );
     // Bring the status up to date with the filters the workbook was opened with.
     statusRowsByWorksheetId.forEach((row, worksheetId) => scheduleFilterStatusUpdate(worksheetId));
@@ -239,6 +260,11 @@ async function loadConfiguration() {
         `Automatic filter refresh is active (${pluralize(ruleCount, "rule")} on ` +
           `${pluralize(rulesByWorksheetId.size, "worksheet")}).${invalidText}`
       );
+    }
+
+    // A worksheet left behind (e.g. in an earlier session) catches up now.
+    if (watchesActivation) {
+      requestCatchUp();
     }
   } catch (error) {
     console.error(error);
@@ -297,6 +323,16 @@ function isSelectionRule(rule) {
   );
 }
 
+/** refresh-on-activate: triggered by activating its worksheet. */
+function isActivationRule(rule) {
+  return rule.action === ACTION_REFRESH_ON_ACTIVATE;
+}
+
+/** Rules triggered by changing their watched cells. */
+function isChangeRule(rule) {
+  return !isSelectionRule(rule) && !isActivationRule(rule);
+}
+
 function scheduleConfigurationReload() {
   window.clearTimeout(reloadTimer);
   reloadTimer = window.setTimeout(loadConfiguration, RELOAD_DEBOUNCE_MS);
@@ -310,15 +346,17 @@ function scheduleConfigurationReload() {
  * Registers each kind of listener once per worksheet that needs it: change
  * listeners for worksheets with change rules, calculation listeners for those
  * and for worksheets listed in the status sheet, filter listeners for listed
- * worksheets, and selection listeners for worksheets with selection rules.
- * Handlers look up rules at event time, so reloading the configuration never
- * needs to re-register listeners for worksheets that already have them.
+ * worksheets, selection listeners for worksheets with selection rules, and
+ * one activation listener for the workbook once refresh-on-activate rules
+ * exist. Handlers look up rules at event time, so reloading the configuration
+ * never needs to re-register listeners for worksheets that already have them.
  */
 async function registerEventHandlers(
   changeWorksheetIds,
   calculatedWorksheetIds,
   filteredWorksheetIds,
-  selectionWorksheetIds
+  selectionWorksheetIds,
+  watchesActivation
 ) {
   const notIn = (registered) => (id) => !registered.has(id);
   const newChangeIds = changeWorksheetIds.filter(notIn(changeRegisteredWorksheetIds));
@@ -335,11 +373,20 @@ async function registerEventHandlers(
     newSelectionIds = [];
   }
 
+  // Like the other listeners, it stays registered after a reload; the handler
+  // finds no rules then.
+  let newActivation = watchesActivation && !activatedHandlerRegistered;
+  if (newActivation && !Office.context.requirements.isSetSupported("ExcelApi", "1.7")) {
+    console.error("Activation events (ExcelApi 1.7) are not supported; worksheets refresh only on load.");
+    newActivation = false;
+  }
+
   if (
     newChangeIds.length === 0 &&
     newCalculatedIds.length === 0 &&
     newFilteredIds.length === 0 &&
     newSelectionIds.length === 0 &&
+    !newActivation &&
     worksheetAddedHandlerRegistered
   ) {
     return;
@@ -374,9 +421,16 @@ async function registerEventHandlers(
       worksheets.onAdded.add(handleWorksheetAdded);
     }
 
+    if (newActivation) {
+      worksheets.onActivated.add(handleWorksheetActivated);
+    }
+
     await context.sync();
   });
 
+  if (newActivation) {
+    activatedHandlerRegistered = true;
+  }
   newChangeIds.forEach((id) => changeRegisteredWorksheetIds.add(id));
   newCalculatedIds.forEach((id) => calculatedRegisteredWorksheetIds.add(id));
   newFilteredIds.forEach((id) => filteredRegisteredWorksheetIds.add(id));
@@ -416,9 +470,7 @@ function waitsForCalculation(rule) {
 
 async function handleWorksheetChanged(event) {
   // Selection rules never react to changes, e.g. the writes of reset-on-click.
-  const rules = (rulesByWorksheetId.get(event.worksheetId) || []).filter(
-    (rule) => !isSelectionRule(rule)
-  );
+  const rules = (rulesByWorksheetId.get(event.worksheetId) || []).filter(isChangeRule);
 
   if (rules.length === 0) {
     return;
@@ -447,7 +499,8 @@ async function handleWorksheetChanged(event) {
 
   queueChangedRules(
     event.worksheetId,
-    rules.filter((rule) => areasIntersect(rule.watchedAreas, changedAreas))
+    rules.filter((rule) => areasIntersect(rule.watchedAreas, changedAreas)),
+    changedAreas
   );
 }
 
@@ -455,13 +508,22 @@ async function handleWorksheetChanged(event) {
  * Queues change rules as after a change of their watched cells: rules that
  * wait for calculation run after the next calculation (or the fallback), the
  * others after their delay. Rules already waiting are merged, not repeated.
+ *
+ * The refresh-on-activate rules watching the changed cells record the value
+ * once the worksheet's refresh is done (see settleWorksheet). fallbackMs
+ * shortens the wait for a calculation when none is expected.
  */
-function queueChangedRules(worksheetId, matchingRules) {
+function queueChangedRules(worksheetId, matchingRules, changedAreas, fallbackMs = CALCULATION_FALLBACK_MS) {
+  const state = getWorksheetState(worksheetId);
+  const recording = markAppliedPending(worksheetId, changedAreas);
+
   if (matchingRules.length === 0) {
+    if (recording) {
+      settleWorksheet(worksheetId);
+    }
     return;
   }
 
-  const state = getWorksheetState(worksheetId);
   const immediateRules = matchingRules.filter((rule) => !waitsForCalculation(rule));
   const calculatedRules = matchingRules.filter(waitsForCalculation);
 
@@ -477,14 +539,22 @@ function queueChangedRules(worksheetId, matchingRules) {
   }
 
   if (calculatedRules.length > 0) {
+    const hadPendingRules = state.pendingRules.size > 0;
     calculatedRules.forEach((rule) => state.pendingRules.add(rule));
     state.changedAt = performance.now();
+
+    // A shorter wait never cuts short the wait of rules already pending.
+    const fallbackAt = Math.max(
+      state.changedAt + Math.max(fallbackMs, maxDelay(state.pendingRules)),
+      hadPendingRules ? state.fallbackAt : 0
+    );
+    state.fallbackAt = fallbackAt;
 
     window.clearTimeout(state.debounceTimer);
     window.clearTimeout(state.fallbackTimer);
     state.fallbackTimer = window.setTimeout(
       () => flushPendingRules(worksheetId),
-      CALCULATION_FALLBACK_MS
+      fallbackAt - state.changedAt
     );
 
     setStatus("Change detected. Waiting for calculation.");
@@ -658,6 +728,8 @@ async function writeClickedTargets(worksheetId, rules) {
   // Toggle targets on other worksheets: name -> (address -> value).
   const otherValues = new Map();
   let switchedTo = null;
+  // Other worksheets whose refresh waits until they are activated.
+  const deferredSheets = new Set();
   const ownName = rules[0].worksheetName;
   const selectAddress =
     rules[0].action === ACTION_TOGGLE_ON_CLICK ? rules[0].selectAddress : rules[0].targetAddresses[0];
@@ -713,11 +785,26 @@ async function writeClickedTargets(worksheetId, rules) {
       if (toggledAreas.length > 0) {
         queueWrittenRules(worksheetId, toggledAreas);
       }
-      // The rules of the other worksheets follow their written cells as well.
+      // The rules of the other worksheets follow their written cells as well,
+      // unless a refresh-on-activate rule defers them until the worksheet is
+      // opened. Deferred cells are still marked as the add-in's own write, so
+      // their change events do not queue the rules after all.
       for (const [name, cells] of otherValues) {
         const otherId = worksheetIdByName(name);
-        if (otherId !== null) {
-          queueWrittenRules(otherId, parseAddressList([...cells.keys()].join(",")));
+        if (otherId === null) {
+          continue;
+        }
+        const writtenAreas = parseAddressList([...cells.keys()].join(","));
+        const deferredAreas = writtenAreas.filter((area) => isRefreshedOnActivate(otherId, [area]));
+        const queuedAreas = writtenAreas.filter((area) => !deferredAreas.includes(area));
+
+        markOwnWrite(otherId, writtenAreas);
+        if (queuedAreas.length > 0) {
+          queueRulesWatching(otherId, queuedAreas);
+        }
+        if (deferredAreas.length > 0) {
+          deferredSheets.add(name);
+          getWorksheetState(otherId).deferredWriteAt = performance.now();
         }
       }
 
@@ -731,10 +818,18 @@ async function writeClickedTargets(worksheetId, rules) {
 
   if (toggleRules.length === 0) {
     setStatus(`Reset ${pluralize(values.size, "cell")} on ${rules[0].worksheetName}.`);
-  } else if (!hasRefreshWork(getWorksheetState(worksheetId))) {
-    // With dependent rules, their progress is shown instead.
+  } else if (deferredSheets.size > 0 || !hasRefreshWork(getWorksheetState(worksheetId))) {
+    // With dependent rules, their progress is shown instead, after this
+    // message when other worksheets wait for activation.
     const others = otherValues.size > 0 ? ` and on ${pluralize(otherValues.size, "other worksheet")}` : "";
-    setStatus(`Switched the toggle on ${ownName}${others} to "${switchedTo}".`);
+    let deferred = "";
+    if (deferredSheets.size > 0) {
+      deferred =
+        deferredSheets.size === otherValues.size
+          ? `; ${otherValues.size === 1 ? "it refreshes" : "they refresh"} when opened`
+          : `; ${deferredSheets.size} of them ${deferredSheets.size === 1 ? "refreshes" : "refresh"} when opened`;
+    }
+    setStatus(`Switched the toggle on ${ownName}${others} to "${switchedTo}"${deferred}.`);
   }
 }
 
@@ -753,15 +848,33 @@ function worksheetIdByName(name) {
  * had been typed, and marks the write so its own change event is ignored.
  */
 function queueWrittenRules(worksheetId, writtenAreas) {
+  markOwnWrite(worksheetId, writtenAreas);
+  queueRulesWatching(worksheetId, writtenAreas);
+}
+
+/** Marks cells the add-in wrote, so their change events are ignored for a while. */
+function markOwnWrite(worksheetId, writtenAreas) {
   const state = getWorksheetState(worksheetId);
   state.ownWriteAreas = writtenAreas;
   state.ownWriteIgnoreUntil = performance.now() + OWN_WRITE_GRACE_MS;
+}
 
+/** Queues the change rules watching the areas, as if a value had been typed there. */
+function queueRulesWatching(worksheetId, areas, fallbackMs = CALCULATION_FALLBACK_MS) {
   queueChangedRules(
     worksheetId,
     (rulesByWorksheetId.get(worksheetId) || []).filter(
-      (rule) => !isSelectionRule(rule) && areasIntersect(rule.watchedAreas, writtenAreas)
-    )
+      (rule) => isChangeRule(rule) && areasIntersect(rule.watchedAreas, areas)
+    ),
+    areas,
+    fallbackMs
+  );
+}
+
+/** Whether a refresh-on-activate rule of the worksheet watches one of the areas. */
+function isRefreshedOnActivate(worksheetId, areas) {
+  return (rulesByWorksheetId.get(worksheetId) || []).some(
+    (rule) => isActivationRule(rule) && areasIntersect(rule.watchedAreas, areas)
   );
 }
 
@@ -1016,6 +1129,7 @@ function getWorksheetState(worksheetId) {
       changedAt: 0,
       debounceTimer: null,
       fallbackTimer: null,
+      fallbackAt: 0,
       immediateRules: new Set(),
       immediateChangedAt: 0,
       immediateTimer: null,
@@ -1033,6 +1147,16 @@ function getWorksheetState(worksheetId) {
       ownSortIgnoreUntil: 0,
       ownWriteAreas: null,
       ownWriteIgnoreUntil: 0,
+      // refresh-on-activate rules whose value is recorded once the refresh
+      // is done; refreshFailed skips that, so the worksheet refreshes again.
+      appliedPending: new Set(),
+      refreshFailed: false,
+      settling: false,
+      settleRequested: false,
+      // Resolved when no refresh is running or waiting (see whenSettled).
+      settledWaiters: [],
+      // When a toggle last wrote a cell here without queuing its rules.
+      deferredWriteAt: 0,
     });
   }
 
@@ -1063,6 +1187,13 @@ function resetPendingWork() {
     clearWaitingWork(state);
     state.queuedRules.clear();
     state.queuedTiming = null;
+    // The rules belong to the old configuration. Unrecorded worksheets
+    // refresh again when activated.
+    state.appliedPending.clear();
+    state.refreshFailed = false;
+    if (!hasRefreshWork(state)) {
+      resolveSettledWaiters(state);
+    }
   }
 }
 
@@ -1086,7 +1217,12 @@ async function runRefresh(worksheetId, rules, timing) {
   state.running = true;
 
   try {
-    await applyRules(worksheetId, rules, timing);
+    if (!(await applyRules(worksheetId, rules, timing))) {
+      state.refreshFailed = true;
+    }
+  } catch (error) {
+    state.refreshFailed = true;
+    throw error;
   } finally {
     state.running = false;
   }
@@ -1102,6 +1238,219 @@ async function runRefresh(worksheetId, rules, timing) {
 
   // The add-in's own filter and sort change the filters too.
   scheduleFilterStatusUpdate(worksheetId);
+  await settleWorksheet(worksheetId);
+}
+
+// ---------------------------------------------------------------------------
+// Recorded values and catch-up (refresh-on-activate)
+// ---------------------------------------------------------------------------
+
+/**
+ * Marks the refresh-on-activate rules of the worksheet watching the changed
+ * areas, so their value is recorded when the refresh is done. Returns whether
+ * any rule was marked.
+ */
+function markAppliedPending(worksheetId, changedAreas) {
+  const state = getWorksheetState(worksheetId);
+  let marked = false;
+
+  for (const rule of rulesByWorksheetId.get(worksheetId) || []) {
+    if (isActivationRule(rule) && areasIntersect(rule.watchedAreas, changedAreas)) {
+      state.appliedPending.add(rule);
+      marked = true;
+    }
+  }
+
+  return marked;
+}
+
+/**
+ * Called when a refresh of the worksheet ends: once nothing runs or waits any
+ * more, records the value of every marked refresh-on-activate rule (unless a
+ * refresh failed meanwhile) and resolves the waiting catch-up. A refresh
+ * queued meanwhile settles the worksheet again when it ends.
+ */
+async function settleWorksheet(worksheetId) {
+  const state = getWorksheetState(worksheetId);
+
+  if (state.settling) {
+    state.settleRequested = true;
+    return;
+  }
+
+  state.settling = true;
+  try {
+    do {
+      state.settleRequested = false;
+      if (hasRefreshWork(state)) {
+        return;
+      }
+
+      const rules = [...state.appliedPending];
+      const failed = state.refreshFailed;
+      state.appliedPending.clear();
+      state.refreshFailed = false;
+
+      if (rules.length > 0 && !failed) {
+        await recordAppliedValues(rules);
+      }
+    } while (state.settleRequested);
+  } finally {
+    state.settling = false;
+  }
+
+  if (!hasRefreshWork(state)) {
+    resolveSettledWaiters(state);
+  }
+}
+
+function resolveSettledWaiters(state) {
+  const waiters = state.settledWaiters;
+  state.settledWaiters = [];
+  waiters.forEach((resolve) => resolve());
+}
+
+/**
+ * Resolves when the worksheet has no refresh running or waiting and its
+ * values are recorded, or after CATCH_UP_TIMEOUT_MS at the latest.
+ */
+function whenSettled(worksheetId) {
+  const state = getWorksheetState(worksheetId);
+
+  if (!hasRefreshWork(state) && !state.settling && state.appliedPending.size === 0) {
+    return Promise.resolve();
+  }
+
+  return new Promise((resolve) => {
+    const timer = window.setTimeout(resolve, CATCH_UP_TIMEOUT_MS);
+    state.settledWaiters.push(() => {
+      window.clearTimeout(timer);
+      resolve();
+    });
+  });
+}
+
+/**
+ * Writes the current value of each rule's watched cell into its target cell.
+ * The target is expected on an unprotected (hidden) worksheet. A failure is
+ * reported and otherwise ignored: the worksheet then refreshes once more when
+ * it is next activated.
+ */
+async function recordAppliedValues(rules) {
+  try {
+    await Excel.run(async (context) => {
+      const worksheets = context.workbook.worksheets;
+      const watched = rules.map((rule) => {
+        const range = worksheets.getItem(rule.worksheetId).getRange(rule.watchedAddress);
+        range.load("values");
+        return range;
+      });
+      await context.sync();
+
+      rules.forEach((rule, index) => {
+        worksheets
+          .getItem(rule.appliedTarget.worksheetName)
+          .getRange(rule.appliedTarget.address).values = [[watched[index].values[0][0]]];
+      });
+      await context.sync();
+    });
+  } catch (error) {
+    console.error(error, error.debugInfo);
+    appendStatus(
+      `The refreshed state of ${rules[0].worksheetName} could not be recorded ` +
+        `(${describeError(error)}); it refreshes again when opened.`
+    );
+  }
+}
+
+function handleWorksheetActivated() {
+  requestCatchUp();
+}
+
+/**
+ * Catches up the active worksheet. One catch-up runs at a time: activations
+ * meanwhile are merged into one more round, which handles whichever worksheet
+ * is active then. A worksheet's refresh is never interrupted; it ends even
+ * after the user has moved on.
+ */
+async function requestCatchUp() {
+  if (catchUpRunning) {
+    catchUpRequested = true;
+    return;
+  }
+
+  catchUpRunning = true;
+  try {
+    do {
+      catchUpRequested = false;
+      try {
+        await catchUpActiveWorksheet();
+      } catch (error) {
+        console.error(error, error.debugInfo);
+        setStatus(`Catch-up failed: ${describeError(error)}`);
+      }
+    } while (catchUpRequested);
+  } finally {
+    catchUpRunning = false;
+  }
+}
+
+/**
+ * Runs the rules of the active worksheet whose refresh-on-activate value
+ * differs from the recorded one, as if the value had been typed, and waits
+ * until they are done and the value is recorded.
+ */
+async function catchUpActiveWorksheet() {
+  const stale = await Excel.run(async (context) => {
+    const active = context.workbook.worksheets.getActiveWorksheet();
+    active.load("id");
+    await context.sync();
+
+    const rules = (rulesByWorksheetId.get(active.id) || []).filter(isActivationRule);
+    if (rules.length === 0) {
+      return [];
+    }
+
+    const cells = rules.map((rule) => {
+      const watched = active.getRange(rule.watchedAddress);
+      const recorded = context.workbook.worksheets
+        .getItem(rule.appliedTarget.worksheetName)
+        .getRange(rule.appliedTarget.address);
+      watched.load("values");
+      recorded.load("values");
+      return { watched, recorded };
+    });
+    await context.sync();
+
+    // A rule still marked is being refreshed already (e.g. the user came
+    // back before it was done) and is recorded when that ends.
+    const state = getWorksheetState(active.id);
+    return rules.filter(
+      (rule, index) =>
+        !state.appliedPending.has(rule) &&
+        String(cells[index].watched.values[0][0] ?? "") !== String(cells[index].recorded.values[0][0] ?? "")
+    );
+  });
+
+  if (stale.length === 0) {
+    return;
+  }
+
+  const worksheetId = stale[0].worksheetId;
+  const state = getWorksheetState(worksheetId);
+  // The value was written a while ago and calculated since, so the rules wait
+  // for a calculation only until CALCULATION_FALLBACK_MS after that write.
+  const fallbackMs = Math.max(0, state.deferredWriteAt + CALCULATION_FALLBACK_MS - performance.now());
+
+  queueRulesWatching(
+    worksheetId,
+    stale.flatMap((rule) => rule.watchedAreas),
+    fallbackMs
+  );
+  if (hasRefreshWork(state)) {
+    setStatus(`Refreshing ${stale[0].worksheetName}...`);
+  }
+  await whenSettled(worksheetId);
 }
 
 // ---------------------------------------------------------------------------
@@ -1112,6 +1461,7 @@ async function runRefresh(worksheetId, rules, timing) {
  * filter-table: for each rule, its table column shows only its values while
  * the watched cell holds its TargetValue; otherwise the column's filter is
  * cleared. A slicer on the column follows, as its filter is the table's.
+ * Returns whether it succeeded.
  */
 async function applyTableFilters(worksheetId, rules) {
   setStatus("Filtering tables...");
@@ -1139,11 +1489,13 @@ async function applyTableFilters(worksheetId, rules) {
   } catch (error) {
     console.error(error, error.debugInfo);
     setStatus(`Table filter failed: ${describeError(error)}`);
-    return;
+    return false;
   }
   setStatus(`Filtered ${pluralize(rules.length, "table column")}.`);
+  return true;
 }
 
+/** Runs the rules on the worksheet and returns whether all of it succeeded. */
 async function applyRules(worksheetId, rules, timing) {
   // Merge rules: one value filter per column, the last sort rule, and every
   // column rule, so each piece of work is done once.
@@ -1154,8 +1506,9 @@ async function applyRules(worksheetId, rules, timing) {
   // Table filters first: they need no AutoFilter on this worksheet.
   const tableRules = rules.filter((rule) => rule.action === ACTION_FILTER_TABLE);
   const tableStartedAt = performance.now();
+  let tablesDone = true;
   if (tableRules.length > 0) {
-    await applyTableFilters(worksheetId, tableRules);
+    tablesDone = await applyTableFilters(worksheetId, tableRules);
   }
   const tableMs = performance.now() - tableStartedAt;
 
@@ -1173,7 +1526,7 @@ async function applyRules(worksheetId, rules, timing) {
   }
 
   if (valuesByColumn.size === 0 && !sortRule && columnRules.length === 0) {
-    return;
+    return tablesDone;
   }
 
   const stepStartedAt = performance.now();
@@ -1384,9 +1737,11 @@ async function applyRules(worksheetId, rules, timing) {
 
     console.debug(text);
     setStatus(text);
+    return tablesDone;
   } catch (error) {
     console.error(error, error.debugInfo);
     setStatus(`Refresh failed: ${describeError(error)}`);
+    return false;
   }
 }
 
@@ -1875,17 +2230,19 @@ async function refreshActiveWorksheet() {
   }
 
   // Click rules only run when their cell is clicked.
-  const rules = (rulesByWorksheetId.get(worksheetId) || []).filter(
-    (rule) => !isSelectionRule(rule)
-  );
+  const sheetRules = rulesByWorksheetId.get(worksheetId) || [];
+  const rules = sheetRules.filter(isChangeRule);
 
   if (rules.length === 0) {
     setStatus("No filter refresh rule is configured for the active worksheet.");
     return;
   }
 
-  // The manual run covers anything still waiting.
-  clearWaitingWork(getWorksheetState(worksheetId));
+  // The manual run covers anything still waiting, and the worksheet is up to
+  // date for every refresh-on-activate rule afterwards.
+  const state = getWorksheetState(worksheetId);
+  clearWaitingWork(state);
+  sheetRules.filter(isActivationRule).forEach((rule) => state.appliedPending.add(rule));
 
   const now = performance.now();
   await runRefresh(worksheetId, rules, { changedAt: now, readyAt: now });
@@ -1901,6 +2258,13 @@ function setStatus(message) {
   if (status) {
     status.textContent = message;
   }
+}
+
+/** Adds a sentence to the status line, keeping what it says. */
+function appendStatus(message) {
+  const status = document.getElementById("status");
+  const current = status ? status.textContent.trim() : "";
+  setStatus(current ? `${current} ${message}` : message);
 }
 
 function setProblems(messages) {

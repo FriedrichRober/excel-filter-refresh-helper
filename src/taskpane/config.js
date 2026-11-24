@@ -9,7 +9,8 @@
  *   Worksheet        worksheet name
  *   WatchedCells     cells or ranges that trigger the rule, e.g. "B2,B3" or "B2:B4"
  *   Action           filter-value (default), sort, show-columns, filter-table,
- *                    reset-on-click, toggle-on-click or multi-select-on-click
+ *                    reset-on-click, toggle-on-click, multi-select-on-click or
+ *                    refresh-on-activate
  *   FilterColumnIndex  filter-value: zero-based column within the AutoFilter range
  *   FilterValue        filter-value: the value to show in that column
  *                      filter-table: the values to show, separated by "|"
@@ -25,6 +26,10 @@
  *                      e.g. "C3,'Other sheet'!D3" (the first holds the value
  *                      it switches from)
  *                      multi-select-on-click: the one cell to write
+ *                      refresh-on-activate: the one cell, usually on another
+ *                      (hidden) worksheet, e.g. "'Applied'!C2", that holds the
+ *                      value of the watched cell the worksheet was last
+ *                      refreshed for
  *   TargetValue        filter-table: the value of the watched cell that filters
  *                      reset-on-click: the value written into each target cell
  *                      toggle-on-click: two different values, "first;second"
@@ -54,9 +59,11 @@
  * as an on/off switch: if the first target cell holds the first value of
  * TargetValue, every target cell gets the second value, otherwise the first.
  * Then SelectCell is selected. The other rules watching the written cells run
- * as if the value had been typed. It needs no AutoFilter and must leave
- * DelayMs, FilterColumnIndex, FilterValue, SortColumnIndex, SortOrder and
- * ColumnChoices empty.
+ * as if the value had been typed, on the rule's worksheet at once and on other
+ * worksheets too, unless a refresh-on-activate rule watches the written cell
+ * there: those worksheets refresh when they are next activated. It needs no
+ * AutoFilter and must leave DelayMs, FilterColumnIndex, FilterValue,
+ * SortColumnIndex, SortOrder and ColumnChoices empty.
  *
  * filter-table runs right after the change, like show-columns: when the watched
  * cell holds TargetValue, the table column of TargetCells shows only the
@@ -72,6 +79,16 @@
  * otherwise the ticked entries joined by ", " in list order; the other rules
  * watching it run as if the value had been typed. After OK or Cancel,
  * SelectCell is selected. It leaves the same columns empty as toggle-on-click.
+ *
+ * refresh-on-activate defers the refresh of a worksheet until it is opened.
+ * WatchedCells is one cell (e.g. a toggle, or the first cell of a merged
+ * one), TargetCells one cell that holds the value the worksheet was last
+ * refreshed for. When the worksheet is activated (or is active when the
+ * configuration loads) and the two values differ, the rules of the worksheet
+ * watching that cell run as if the value had been typed, and then the
+ * watched value is written into the target cell. It is written as well
+ * whenever those rules run for that cell otherwise. Only WatchedCells,
+ * TargetCells and Platforms are used; every other column must be empty.
  */
 
 import { areasIntersect, columnLetters, parseAddressList, splitAddressList, splitWorksheetPrefix } from "./address";
@@ -86,6 +103,7 @@ export const ACTION_RESET_ON_CLICK = "reset-on-click";
 export const ACTION_TOGGLE_ON_CLICK = "toggle-on-click";
 export const ACTION_MULTI_SELECT_ON_CLICK = "multi-select-on-click";
 export const ACTION_FILTER_TABLE = "filter-table";
+export const ACTION_REFRESH_ON_ACTIVATE = "refresh-on-activate";
 // The separator of the values of filter-table in FilterValue.
 export const TABLE_VALUE_SEPARATOR = "|";
 const SUPPORTED_ACTIONS = [
@@ -96,6 +114,7 @@ const SUPPORTED_ACTIONS = [
   ACTION_TOGGLE_ON_CLICK,
   ACTION_MULTI_SELECT_ON_CLICK,
   ACTION_FILTER_TABLE,
+  ACTION_REFRESH_ON_ACTIVATE,
 ];
 
 export const PLATFORM_WEB = "web";
@@ -213,6 +232,12 @@ function buildRule(cell, worksheetsByName) {
         throw new Error(`${COLUMNS[key].header} must be empty for ${action}.`);
       }
     }
+  } else if (action === ACTION_REFRESH_ON_ACTIVATE) {
+    for (const key of ACTIVATE_UNUSED_COLUMNS) {
+      if (!isBlank(cell(key))) {
+        throw new Error(`${COLUMNS[key].header} must be empty for ${action}.`);
+      }
+    }
   }
 
   let delayMs = DEFAULT_DELAY_MS;
@@ -312,6 +337,23 @@ function buildRule(cell, worksheetsByName) {
     if (rule.selectionTitle === "") {
       throw new Error("SelectionTitle is empty.");
     }
+  } else if (action === ACTION_REFRESH_ON_ACTIVATE) {
+    const [area] = watchedAreas;
+    if (watchedAreas.length !== 1 || area.top !== area.bottom || area.left !== area.right) {
+      throw new Error(`WatchedCells must be a single cell for ${action}, e.g. "C3".`);
+    }
+    rule.watchedAddress = `${columnLetters(area.left)}${area.top}`;
+
+    // May lie on another worksheet, like the targets of toggle-on-click.
+    const targets = parseToggleTargets(cell("targetCells"), worksheet.name);
+    if (targets.length !== 1) {
+      throw new Error(`TargetCells must be a single cell for ${action}.`);
+    }
+    const targetSheet = worksheetsByName.get(targets[0].worksheetName.toLowerCase());
+    if (!targetSheet) {
+      throw new Error(`Worksheet "${targets[0].worksheetName}" of TargetCells was not found.`);
+    }
+    rule.appliedTarget = { worksheetName: targetSheet.name, address: targets[0].address };
   }
 
   return rule;
@@ -415,6 +457,14 @@ const CLICK_UNUSED_COLUMNS = [
   "sortColumnIndex",
   "sortOrder",
   "columnChoices",
+];
+
+/** Columns that refresh-on-activate must leave empty. */
+const ACTIVATE_UNUSED_COLUMNS = [
+  ...CLICK_UNUSED_COLUMNS,
+  "targetValue",
+  "selectCell",
+  "selectionTitle",
 ];
 
 /** Parses "first;second" into two trimmed values that differ (ignoring case). */
